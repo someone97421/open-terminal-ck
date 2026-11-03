@@ -144,9 +144,35 @@ class UserFS:
     users' home directories (``/home/<other_user>/…``).
     """
 
-    def __init__(self, username: str | None = None, home: str | None = None):
+    def __init__(self, username: str | None = None, home: str | None = None, workspace_root: str | None = None):
         self.username = username
         self.home = home or os.getcwd()
+        self.workspace_root = os.path.realpath(workspace_root) if workspace_root else None
+
+    def load_cwd(self) -> str:
+        if not self.workspace_root:
+            return self.home
+        try:
+            with open(os.path.join(self.workspace_root, "cache", "cwd.json"), encoding="utf-8") as source:
+                path = self.resolve_path(json.load(source)["cwd"])
+            return path if os.path.isdir(path) else self.home
+        except (OSError, ValueError, TypeError, KeyError):
+            return self.home
+
+    def save_cwd(self, path: str) -> None:
+        if not self.workspace_root:
+            return
+        self._check_path(path)
+        directory = self.resolve_path(os.path.join(self.workspace_root, "cache"))
+        os.makedirs(directory, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as output:
+                json.dump({"cwd": os.path.relpath(path, self.workspace_root)}, output)
+            os.replace(temporary, os.path.join(directory, "cwd.json"))
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
     # ------------------------------------------------------------------
     # Path resolution
@@ -164,6 +190,14 @@ class UserFS:
         default home) are automatically rewritten to the provisioned user's
         home directory, since LLMs often hardcode that path.
         """
+        if self.workspace_root:
+            if path == "~":
+                path = self.home
+            elif path.startswith("~/"):
+                path = os.path.join(self.home, path[2:])
+            target = os.path.normpath(os.path.join(cwd or self.home, path))
+            self._check_path(target)
+            return target
         if os.path.isabs(path):
             # Swap /home/user (and /home/usr, a common LLM hallucination)
             # → user's actual home when multi-user is active
@@ -184,6 +218,11 @@ class UserFS:
 
     def is_path_allowed(self, path: str) -> bool:
         """Return *False* if *path* is inside another user's home directory."""
+        if self.workspace_root:
+            try:
+                return os.path.commonpath((self.workspace_root, os.path.realpath(path))) == self.workspace_root
+            except ValueError:
+                return False
         if not self.username:
             return True
         resolved = os.path.abspath(path)
@@ -411,6 +450,8 @@ class UserFS:
     async def remove(self, path: str) -> None:
         """Remove *path* (file or directory)."""
         self._check_path(path)
+        if self.workspace_root and os.path.realpath(path) == self.workspace_root:
+            raise PermissionError("不可删除工作区根目录")
         if os.path.isdir(path):
             await asyncio.to_thread(shutil.rmtree, path)
         else:
@@ -418,6 +459,8 @@ class UserFS:
 
     async def move(self, source: str, destination: str) -> None:
         """Move *source* to *destination*."""
+        if self.workspace_root and os.path.realpath(source) == self.workspace_root:
+            raise PermissionError("不可移动工作区根目录")
         self._check_path(source)
         self._check_path(destination)
         await asyncio.to_thread(shutil.move, source, destination)

@@ -22,6 +22,9 @@ from nbclient import NotebookClient
 from open_terminal.dependencies import get_filesystem, verify_api_key
 from open_terminal.env import sanitized_environ
 from open_terminal.utils.fs import UserFS
+from open_terminal.env import IMAGE_MAX_EDGE, IMAGE_MAX_BYTES, IMAGE_MAX_PIXELS
+from open_terminal.utils.image_context import ImageContextGateway, ImageContextError, sanitize_model_payload
+from open_terminal.utils.limits import run_io
 
 
 # ---------------------------------------------------------------------------
@@ -34,14 +37,15 @@ _IDLE_TIMEOUT = 30 * 60  # 30 minutes
 class _Session:
     """Wraps a NotebookClient for a specific notebook."""
 
-    __slots__ = ("id", "path", "nb", "client", "owner", "busy", "created_at", "last_used")
+    __slots__ = ("id", "path", "nb", "client", "owner", "chat", "busy", "created_at", "last_used")
 
-    def __init__(self, session_id: str, path: str, nb, client, owner: str):
+    def __init__(self, session_id: str, path: str, nb, client, owner: str, chat: str):
         self.id = session_id
         self.path = path
         self.nb = nb
         self.client = client
         self.owner = owner
+        self.chat = chat
         self.busy = False
         self.created_at = time.time()
         self.last_used = time.time()
@@ -150,7 +154,7 @@ router = APIRouter(
 
 def owned_session(session_id: str, request: Request) -> _Session:
     session = _sessions.get(session_id)
-    if not session or session.owner != request.headers.get("x-user-id", ""):
+    if not session or session.owner != request.headers.get("x-user-id", "") or session.chat != request.headers.get("x-session-id", ""):
         raise HTTPException(status_code=404, detail="Session not found")
     return session
 
@@ -210,7 +214,7 @@ async def create_session(req: CreateSessionRequest, request: Request, fs: UserFS
         )
 
     session_id = uuid.uuid4().hex[:12]
-    _sessions[session_id] = _Session(session_id, path, nb, client, request.headers.get("x-user-id", ""))
+    _sessions[session_id] = _Session(session_id, path, nb, client, request.headers.get("x-user-id", ""), request.headers.get("x-session-id", ""))
 
     return CreateSessionResponse(
         id=session_id, kernel=kernel_name, status="ready"
@@ -287,6 +291,18 @@ async def execute_cell(
         await fs.write(session.path, nb_json)
     except Exception:
         pass  # non-fatal
+
+    gateway = ImageContextGateway(max_edge=IMAGE_MAX_EDGE, max_bytes=IMAGE_MAX_BYTES, max_pixels=IMAGE_MAX_PIXELS)
+    def preview_outputs():
+        result = []
+        for output in outputs:
+            try:
+                result.append(sanitize_model_payload(output, gateway))
+            except ImageContextError as exc:
+                result.append({"output_type": "stream", "name": "stderr", "text": f"此项输出未进入模型：{exc}"})
+        return result
+
+    outputs = await run_io(preview_outputs)
 
     return ExecuteCellResponse(
         status="ok", execution_count=ec, outputs=outputs

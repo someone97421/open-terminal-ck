@@ -4,7 +4,7 @@ from typing import Optional
 from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from open_terminal.env import API_KEY, MULTI_USER
+from open_terminal.env import API_KEY, MULTI_USER, WORKSPACE_DIR
 from open_terminal.utils.fs import UserFS
 
 if MULTI_USER:
@@ -37,6 +37,8 @@ def get_filesystem(request: Request) -> UserFS:
     Multi-user mode requires ``X-User-Id`` to select the user's workspace.
     Otherwise returns a plain ``UserFS`` using stdlib.
     """
+    if WORKSPACE_DIR:
+        return UserFS(home=WORKSPACE_DIR, workspace_root=WORKSPACE_DIR)
     if not MULTI_USER:
         return UserFS()
     user_id = request.headers.get("x-user-id")

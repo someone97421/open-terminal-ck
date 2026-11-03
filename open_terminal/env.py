@@ -204,3 +204,20 @@ SESSION_CWD_TTL: float = float(
         config.get("session_cwd_ttl", 604_800),  # 7 days
     )
 )
+
+
+# 工作区网关与内部工作进程使用同一镜像，运行依赖只读共用。
+WORKSPACE_ISOLATION = os.environ.get("OPEN_TERMINAL_WORKSPACE_ISOLATION", "false").lower() in ("true", "1", "yes")
+WORKSPACE_DIR = os.environ.get("OPEN_TERMINAL_WORKSPACE_DIR", "")
+WORKSPACE_ROOT = os.environ.get("OPEN_TERMINAL_WORKSPACE_ROOT", "/workspaces")
+WORKSPACE_RUNTIME_PATHS = [path for path in os.environ.get("OPEN_TERMINAL_WORKSPACE_RUNTIME_PATHS", "").split(os.pathsep) if path]
+WORKSPACE_MAX_WORKERS = int(os.environ.get("OPEN_TERMINAL_WORKSPACE_MAX_WORKERS", "32"))
+WORKSPACE_NETWORK = os.environ.get("OPEN_TERMINAL_WORKSPACE_NETWORK", "isolated")
+IMAGE_MAX_EDGE = int(os.environ.get("OPEN_TERMINAL_IMAGE_MAX_EDGE", "2048"))
+IMAGE_MAX_BYTES = int(os.environ.get("OPEN_TERMINAL_IMAGE_MAX_BYTES", str(2 * 1024 * 1024)))
+IMAGE_MAX_PIXELS = int(os.environ.get("OPEN_TERMINAL_IMAGE_MAX_PIXELS", "40000000"))
+
+if WORKSPACE_ISOLATION or WORKSPACE_DIR:
+    MULTI_USER = False
+    ENABLE_BROWSER = False
+    ENABLE_DESKTOP = False

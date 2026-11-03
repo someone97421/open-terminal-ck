@@ -73,6 +73,7 @@ FROM python:3.12.13-alpine
 #
 RUN apk add --no-cache \
         tini \
+        bubblewrap \
         su-exec \
         coreutils \
         curl \
@@ -118,6 +119,7 @@ RUN pip install --no-cache-dir --no-deps . \
 # The entrypoint handles any root-level setup (iptables, chown) via su-exec.
 #
 RUN adduser -D -s /bin/bash -u 1000 user
+RUN mkdir -p /workspaces && chown user:user /workspaces
 
 COPY entrypoint-slim.sh /app/entrypoint-slim.sh
 RUN chmod +x /app/entrypoint-slim.sh

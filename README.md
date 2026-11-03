@@ -13,6 +13,10 @@ You can run it two ways:
 - **Docker (sandboxed)** — runs in an isolated container with a full toolkit pre-installed: Python, Node.js, git, build tools, data science libraries, ffmpeg, and more. Great for giving AI agents a safe playground without touching your host system.
 - **Bare metal** — install it with `pip` and run it anywhere Python runs. Commands run directly on your machine with access to your real files, your real tools, and your real environment, perfect for local development, personal automation, or giving an AI assistant full access to your actual projects.
 
+## 用户、对话隔离与图片预览（本地定制）
+
+新增可选的用户＋对话持久工作区，系统依赖只读共用；`read_file` 返回最长边默认 2048px、最大 2 MiB 的图片预览，展示及下载保留原图。部署变量、OpenWebUI 归属签名和最终 LLM 请求校验、旧数据迁移及兼容性边界见[接入文档](docs/WORKSPACE_IMAGE_CONTEXT.md)。隔离模式需要 Linux bubblewrap，并须在 OpenWebUI 服务端完成对应接入。
+
 ## Getting Started
 
 ### Docker (recommended)

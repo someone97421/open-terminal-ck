@@ -28,7 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     zip unzip tar gzip bzip2 xz-utils zstd p7zip-full \
     # System
     procps htop lsof strace sysstat \
-    sudo tmux screen tini iptables ipset dnsmasq \
+    sudo tmux screen tini bubblewrap iptables ipset dnsmasq \
     ca-certificates gnupg apt-transport-https \
     # Capabilities (needed for setcap on Python binary)
     libcap2-bin \
@@ -82,6 +82,7 @@ RUN pip install --no-cache-dir . \
     && sed -i "1s|.*|#!/usr/local/bin/python3-ot|" "$(which open-terminal)"
 
 RUN useradd -m -s /bin/bash user && echo 'user ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
+RUN mkdir -p /workspaces && chown user:user /workspaces
 
 USER user
 ENV SHELL=/bin/bash

@@ -30,6 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         less \
         procps \
         tini \
+        bubblewrap \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /install /usr/local
@@ -40,9 +41,9 @@ COPY open_terminal/ open_terminal/
 COPY entrypoint-openshift.sh /app/entrypoint-openshift.sh
 
 RUN pip install --no-cache-dir --no-deps . \
-    && mkdir -p /home/user/.local/bin /home/user/.config /home/user/.local/state /home/user/.cache \
-    && chgrp -R 0 /home/user /app \
-    && chmod -R g=u /home/user /app \
+    && mkdir -p /home/user/.local/bin /home/user/.config /home/user/.local/state /home/user/.cache /workspaces \
+    && chgrp -R 0 /home/user /app /workspaces \
+    && chmod -R g=u /home/user /app /workspaces \
     && chmod +x /app/entrypoint-openshift.sh
 
 WORKDIR /home/user

@@ -68,6 +68,7 @@ FROM python:3.12.13-slim
 #
 RUN apt-get update && apt-get install -y --no-install-recommends \
         tini \
+        bubblewrap \
         gosu \
         curl \
         git \
@@ -111,6 +112,7 @@ RUN pip install --no-cache-dir --no-deps . \
 # The entrypoint handles any root-level setup (iptables, chown) via gosu.
 #
 RUN useradd -m -s /bin/bash -u 1000 user
+RUN mkdir -p /workspaces && chown user:user /workspaces
 
 COPY entrypoint-slim.sh /app/entrypoint-slim.sh
 RUN chmod +x /app/entrypoint-slim.sh

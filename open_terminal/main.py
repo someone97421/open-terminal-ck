@@ -27,13 +27,14 @@ from urllib.parse import quote as url_quote
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from open_terminal.browser.router import BrowserCORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, Response
 from starlette.formparsers import MultiPartParser, MultiPartException, parse_options_header
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 from open_terminal.dependencies import get_filesystem, matches_api_key, verify_api_key
 from open_terminal.env import API_KEY, BINARY_FILE_MIME_PREFIXES, CORS_ALLOWED_ORIGINS, ENABLE_BROWSER, ENABLE_DESKTOP, ENABLE_NOTEBOOKS, ENABLE_SYSTEM_PROMPT, ENABLE_TERMINAL, EXECUTE_DESCRIPTION, EXECUTE_TIMEOUT, FILE_BROWSER_ROOT, LOG_DIR, MAX_TERMINAL_SESSIONS, MULTI_USER, OPEN_TERMINAL_INFO, PROCESS_LOG_RETENTION, SESSION_CWD_TTL, SYSTEM_PROMPT, TERMINAL_TERM
 from open_terminal.env import sanitized_environ
+from open_terminal.env import WORKSPACE_ISOLATION, WORKSPACE_DIR, IMAGE_MAX_EDGE, IMAGE_MAX_BYTES, IMAGE_MAX_PIXELS
 from open_terminal.utils.runner import PipeRunner, ProcessRunner, create_runner, read_pty, write_pty, PtyRunner
 from open_terminal.utils.fs import UserFS, FullFileResponse as FileResponse, TemporaryFileResponse, text_file_response, line_range_offsets
 from open_terminal.utils.limits import (CHUNK_SIZE, NormalizeNullQueryMiddleware, run_io, run_worker)
@@ -41,7 +42,25 @@ from open_terminal.utils.file_compare import CompareRequest, run_comparison
 from open_terminal.utils.git import GitRepository
 from open_terminal.utils.events import system_events
 from open_terminal.utils.search import search_entries, matching_files, ranked_page
+from open_terminal.utils.image_context import ImageContextGateway, ImageContextError, _INPUT_FORMATS
 from open_terminal.utils.skills import join_skill_path, list_skill_resources, parse_skill_frontmatter
+
+image_gateway = ImageContextGateway(max_edge=IMAGE_MAX_EDGE, max_bytes=IMAGE_MAX_BYTES, max_pixels=IMAGE_MAX_PIXELS)
+
+
+def _image_file(path: str, mime: str) -> bool:
+    if mime == "image/svg+xml":
+        return False
+    if mime.startswith("image/"):
+        return True
+    from PIL import Image, UnidentifiedImageError
+    try:
+        with Image.open(path, formats=_INPUT_FORMATS):
+            return True
+    except UnidentifiedImageError:
+        return False
+    except (OSError, ValueError, Image.DecompressionBombError) as exc:
+        raise ImageContextError("图片无法安全识别") from exc
 
 MATCH_PAGE_SIZE = 100
 MAX_CONTENT_MATCHES_PER_FILE = 3
@@ -235,6 +254,11 @@ async def permission_error_handler(request: Request, exc: PermissionError):
     return JSONResponse(status_code=403, content={"detail": str(exc)})
 
 
+@app.exception_handler(ImageContextError)
+async def image_error_handler(request: Request, exc: ImageContextError):
+    return JSONResponse(status_code=415, content={"detail": str(exc)})
+
+
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
@@ -404,13 +428,17 @@ def _get_session_cwd(session_id: str | None, fs: "UserFS") -> str:
     key = (fs.home, session_id)
     if session_id and key in _session_cwds:
         cwd, _ = _session_cwds[key]
+        if fs.workspace_root and (not fs.is_path_allowed(cwd) or not os.path.isdir(cwd)):
+            del _session_cwds[key]
+            return fs.load_cwd()
         _session_cwds[key] = (cwd, time.time())  # refresh TTL
         return cwd
-    return fs.home
+    return fs.load_cwd() if fs.workspace_root else fs.home
 
 
 def _set_session_cwd(session_id: str | None, path: str, fs: "UserFS"):
     """Store a session's cwd.  No-op if *session_id* is ``None``."""
+    fs.save_cwd(path)
     if session_id:
         _expire_session_cwds()
         _session_cwds[(fs.home, session_id)] = (path, time.time())
@@ -850,7 +878,7 @@ async def compare_files(http_request: Request, payload: CompareRequest, fs: User
     "/files/read",
     operation_id="read_file",
     summary="Read a file",
-    description="Read a file and return its contents. Supports text files and images (PNG, JPEG, WebP, etc.). For text files you can optionally request a specific line range. Images are returned as binary so you can view and analyze them directly. Use display_file to show a file to the user.",
+    description="读取文本或图片。图片始终返回受限 JPEG 预览；可用 crop 指定 EXIF 转正后的像素裁剪区域。展示与下载原图请使用 display_file。",
     dependencies=[Depends(verify_api_key)],
     responses={
         404: {"description": "File not found."},
@@ -867,6 +895,7 @@ async def read_file(
     end_line: Optional[int] = Query(
         None, description="Last line to return (1-indexed, inclusive). Defaults to the end of the file.", ge=1
     ),
+    crop: Optional[list[int]] = Query(None, min_length=4, max_length=4, description="图片裁剪 [left, top, right, bottom]，右下边界不包含在内；同样遵守预览限制。"),
     fs: UserFS = Depends(get_filesystem),
 ):
     session_id = http_request.headers.get("x-session-id")
@@ -876,15 +905,20 @@ async def read_file(
         raise HTTPException(status_code=404, detail="File not found")
 
     fs._check_path(target)
+    import mimetypes
+    mime = mimetypes.guess_type(target)[0] or "application/octet-stream"
+    if await run_io(_image_file, target, mime):
+        cache = fs.resolve_path(os.path.join(fs.home, "cache" if fs.workspace_root else ".cache/open-terminal", "image-context"))
+        preview = await run_io(image_gateway.preview_file, target, cache, crop)
+        return Response(preview.data, media_type=preview.mime, headers={"X-Image-Width": str(preview.width), "X-Image-Height": str(preview.height), "Cache-Control": "no-store"})
+    if crop is not None:
+        raise HTTPException(415, "crop 仅适用于可解析的图片")
     try:
         return await text_file_response(target, target, start_line, end_line)
     except UnicodeDecodeError:
         pass
 
-    import mimetypes
     from open_terminal.utils.documents import EXTRACTORS
-
-    mime = mimetypes.guess_type(target)[0] or "application/octet-stream"
     if any(kind and mime == kind or suffix and target.lower().endswith(suffix) for kind, suffix, _ in EXTRACTORS):
         fd, extracted_path = tempfile.mkstemp(suffix=".txt")
         os.close(fd)
@@ -2500,3 +2534,21 @@ if ENABLE_BROWSER:
 if ENABLE_DESKTOP:
     from open_terminal.desktop import router as desktop_router, available as desktop_available
     app.include_router(desktop_router, include_in_schema=desktop_available())
+
+
+if WORKSPACE_ISOLATION:
+    from open_terminal.workspaces import WorkspaceGateway
+    app.add_middleware(WorkspaceGateway)
+
+
+if WORKSPACE_DIR:
+    @app.get("/api/workspace/idle", include_in_schema=False, dependencies=[Depends(verify_api_key)])
+    async def workspace_idle():
+        busy = any(process.finished_at is None for process in _processes.values())
+        if ENABLE_TERMINAL:
+            busy = busy or bool(_terminal_sessions)
+        if ENABLE_NOTEBOOKS:
+            from open_terminal.utils import notebooks
+            busy = busy or bool(notebooks._sessions)
+        busy = busy or any(name.isdigit() and int(name) not in (1, os.getpid()) for name in os.listdir("/proc"))
+        return {"idle": not busy}
