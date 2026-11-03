@@ -1,5 +1,7 @@
 # ⚡ Open Terminal
 
+> Personal self-hosted fork of `open-webui/open-terminal`, maintained for private use. No images or packages are published from here, nothing is contributed upstream, and community process documents are archived in [docs/archive](docs/archive) for reference only.
+
 A lightweight, self-hosted terminal that gives AI agents and automation tools a dedicated environment to run commands, manage files, and execute code — all through a simple API.
 
 ## Why Open Terminal?
@@ -15,8 +17,11 @@ You can run it two ways:
 
 ### Docker (recommended)
 
+This repository publishes no images, so build locally first:
+
 ```bash
-docker run -d --name open-terminal --restart unless-stopped -p 8000:8000 -v open-terminal:/home/user -e OPEN_TERMINAL_API_KEY=your-secret-key ghcr.io/open-webui/open-terminal
+docker build -t open-terminal-ck .
+docker run -d --name open-terminal --restart unless-stopped -p 8000:8000 -v open-terminal:/home/user -e OPEN_TERMINAL_API_KEY=your-secret-key open-terminal-ck
 ```
 
 That's it — you're up and running at `http://localhost:8000`.
@@ -38,9 +43,10 @@ That's it — you're up and running at `http://localhost:8000`.
 **`slim`** and **`alpine`** have the same feature set. Slim uses Debian (glibc) for broader binary compatibility; Alpine uses musl libc and is smaller, but some C-extension pip packages may need to compile from source.
 
 ```bash
-docker run -d -p 8000:8000 -e OPEN_TERMINAL_API_KEY=secret ghcr.io/open-webui/open-terminal:slim
-docker run -d -p 8000:8000 -e OPEN_TERMINAL_API_KEY=secret ghcr.io/open-webui/open-terminal:alpine
-docker run -d -p 8000:8000 -e OPEN_TERMINAL_API_KEY=secret ghcr.io/open-webui/open-terminal:openshift
+docker build -f Dockerfile.slim -t open-terminal-ck:slim .
+docker build -f Dockerfile.alpine -t open-terminal-ck:alpine .
+docker build -f Dockerfile.openshift -t open-terminal-ck:openshift .
+docker run -d -p 8000:8000 -e OPEN_TERMINAL_API_KEY=secret open-terminal-ck:slim
 ```
 
 > [!NOTE]
@@ -54,8 +60,10 @@ docker run -d -p 8000:8000 -e OPEN_TERMINAL_API_KEY=secret ghcr.io/open-webui/op
 
 #### Updating
 
+No image is pulled from a registry. Rebuild the local image, then recreate the container:
+
 ```bash
-docker pull ghcr.io/open-webui/open-terminal
+docker build -t open-terminal-ck .
 docker rm -f open-terminal
 ```
 
@@ -66,11 +74,11 @@ Then re-run the `docker run` command above.
 No Docker? No problem. Open Terminal is a standard Python package:
 
 ```bash
-# One-liner with uvx (no install needed)
-uvx open-terminal run --host 0.0.0.0 --port 8000 --api-key your-secret-key
+# From a checkout: uv sync installs this source tree
+uv run open-terminal run --host 0.0.0.0 --port 8000 --api-key your-secret-key
 
-# Or install globally with pip
-pip install open-terminal
+# Or install this checkout with pip
+pip install .
 open-terminal run --host 0.0.0.0 --port 8000 --api-key your-secret-key
 ```
 
@@ -83,10 +91,10 @@ Add `--cftunnel` to publish the REST API at a temporary HTTPS URL:
 
 ```bash
 # Set OPEN_TERMINAL_API_KEY securely, or set api_key in your TOML config first.
-uvx open-terminal run --cftunnel
+uv run open-terminal run --cftunnel
 
 # Approve downloading cloudflared when running without an interactive terminal.
-uvx open-terminal run --cftunnel --yes
+uv run open-terminal run --cftunnel --yes
 ```
 
 An explicitly configured API key is required: use `OPEN_TERMINAL_API_KEY`,
@@ -162,14 +170,14 @@ If setup fails:
 
 #### Customizing the Docker Environment
 
-The easiest way to add extra packages is with environment variables — no fork needed:
+The easiest way to add extra packages is with environment variables — no image rebuild needed:
 
 ```bash
 docker run -d --name open-terminal -p 8000:8000 \
   -e OPEN_TERMINAL_PACKAGES="cowsay figlet" \
   -e OPEN_TERMINAL_PIP_PACKAGES="httpx polars" \
   -e OPEN_TERMINAL_NPM_PACKAGES="typescript tsx" \
-  ghcr.io/open-webui/open-terminal
+  open-terminal-ck
 ```
 
 | Variable | Description |
@@ -189,17 +197,17 @@ The image includes the Docker CLI, Compose, and Buildx. To let agents build imag
 docker run -d --name open-terminal -p 8000:8000 \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v open-terminal:/home/user \
-  ghcr.io/open-webui/open-terminal
+  open-terminal-ck
 ```
 
 > [!CAUTION]
 > Mounting the Docker socket gives the container **full control over the host's Docker daemon**, which is effectively root access on the host machine. Anyone with access to the terminal can pull/run arbitrary containers (including `--privileged` ones), mount host directories, access host networking, and manage all containers on the host. Only do this in fully trusted environments.
 
-For full control, fork the repo, edit the [Dockerfile](Dockerfile), and build your own image:
+For full control, edit the [Dockerfile](Dockerfile) and build your own image:
 
 ```bash
-docker build -t my-terminal .
-docker run -d --name open-terminal -p 8000:8000 my-terminal
+docker build -t open-terminal-ck .
+docker run -d --name open-terminal -p 8000:8000 open-terminal-ck
 ```
 
 
@@ -326,7 +334,7 @@ Admins can configure Open Terminal connections for all their users from the admi
 
 > [!CAUTION]
 > **Multi-user mode separates workspaces. It does not create a security boundary between users, and it is not designed for production multi-user deployments.**
-> Everyone shares one container: one kernel, one process list, one network stack, one temp directory. Users can watch each other's running commands, reach ports other users open, exhaust CPU, memory and disk for everyone, and interfere with shared system state. Provisioning accounts requires elevated privileges inside the container, so a user who sets out to reach root inside that container will find a way. Run this mode only where every user on the instance is trusted at the same level, and give each user their own instance whenever that trust does not hold. See [SECURITY.md](SECURITY.md) for how reports about this mode are handled.
+> Everyone shares one container: one kernel, one process list, one network stack, one temp directory. Users can watch each other's running commands, reach ports other users open, exhaust CPU, memory and disk for everyone, and interfere with shared system state. Provisioning accounts requires elevated privileges inside the container, so a user who sets out to reach root inside that container will find a way. Run this mode only where every user on the instance is trusted at the same level, and give each user their own instance whenever that trust does not hold. Upstream's report handling for this mode is kept in [docs/archive/SECURITY.md](docs/archive/SECURITY.md).
 
 For small, trusted deployments you can give each user their own workspace inside a single container:
 
@@ -335,7 +343,7 @@ docker run -d --name open-terminal -p 8000:8000 \
   -v open-terminal:/home \
   -e OPEN_TERMINAL_MULTI_USER=true \
   -e OPEN_TERMINAL_API_KEY=your-secret-key \
-  ghcr.io/open-webui/open-terminal
+  open-terminal-ck
 ```
 
 Each user automatically gets a dedicated Linux account with its own home directory, so files, commands, and terminals stay in their own workspace and users do not walk over each other's work. Standard Unix permissions keep the workspaces apart in day-to-day use. They do not protect users from each other, and they are not meant to.
@@ -345,19 +353,6 @@ In multi-user mode, requests that access a user's workspace must include `X-User
 ## API Docs
 
 Full interactive API documentation is available at [http://localhost:8000/docs](http://localhost:8000/docs) once your instance is running.
-
-## Star History
-
-<a href="https://star-history.com/#open-webui/open-terminal&Date">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=open-webui/open-terminal&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=open-webui/open-terminal&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=open-webui/open-terminal&type=Date" />
-  </picture>
-</a>
-
-> [!TIP]
-> **Need real isolation between users?** **[Terminals](https://github.com/open-webui/terminals)** provisions and manages a separate Open Terminal container per user, with its own files, processes, resource limits and network boundary. That is the setup to use when users must be protected from each other. Terminals requires an [Open WebUI Enterprise License](https://docs.openwebui.com/enterprise/) for production use, see the [Terminals documentation](https://docs.openwebui.com/features/open-terminal/terminals/) for deployment and licensing details. Built-in multi-user mode (`OPEN_TERMINAL_MULTI_USER=true`) only gives each user their own workspace inside one shared container.
 
 ## License
 
