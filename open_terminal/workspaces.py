@@ -2,6 +2,8 @@
 
 import asyncio
 import contextlib
+import logging
+import math
 import os
 from pathlib import Path
 import platform
@@ -19,10 +21,12 @@ from starlette.responses import JSONResponse
 
 from open_terminal.env import (
     API_KEY, WORKSPACE_ROOT, WORKSPACE_RUNTIME_PATHS, WORKSPACE_MAX_WORKERS,
-    WORKSPACE_NETWORK,
+    WORKSPACE_NETWORK, WORKSPACE_STARTUP_TIMEOUT,
 )
 from open_terminal.dependencies import matches_api_key
 from open_terminal.workspace_context import verify_workspace_context
+
+log = logging.getLogger(__name__)
 
 _PUBLIC = {"/health", "/api/config", "/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
 _HOP = {b"host", b"connection", b"keep-alive", b"transfer-encoding", b"upgrade", b"authorization", b"proxy-authorization", b"x-workspace-context", b"x-workspace-signature", b"x-user-id", b"x-session-id"}
@@ -39,6 +43,25 @@ _SETTINGS = {
     "IMAGE_MAX_BYTES": "IMAGE_MAX_BYTES", "IMAGE_MAX_PIXELS": "IMAGE_MAX_PIXELS",
     "INFO": "OPEN_TERMINAL_INFO", "CORS_ALLOWED_ORIGINS": "CORS_ALLOWED_ORIGINS",
 }
+
+
+class WorkspaceStartupError(RuntimeError):
+    def __init__(self, message, *, retryable=False, exit_code=None):
+        super().__init__(message)
+        self.retryable = retryable
+        self.exit_code = exit_code
+
+
+async def _stop_process(process):
+    if process.returncode is None:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
+        try:
+            await asyncio.wait_for(process.wait(), 5)
+        except TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            await process.wait()
 
 
 @dataclass
@@ -60,18 +83,32 @@ class WorkspaceWorker:
                 sys.stderr.write(chunk.decode("utf-8", errors="replace"))
                 sys.stderr.flush()
 
-    def startup_error(self, fallback):
+    def startup_error(self, error):
         output = self.stderr_tail.decode("utf-8", errors="replace").lower()
-        if "bwrap:" in output and any(message in output for message in (
-            "no permissions to create a new namespace",
-            "creating new namespace failed",
-            "setting up uid map",
-        )):
-            return (
-                "工作区启动失败：宿主拒绝创建 Linux namespace。请检查 Docker 的 seccomp/AppArmor "
-                "策略及宿主内核的 user namespace 支持；修改 API Key 或关闭工作区隔离不能修复此问题"
+        if "bwrap:" in output and "resource temporarily unavailable" in output and isinstance(error, WorkspaceStartupError):
+            return error
+        if "bwrap:" in output:
+            return WorkspaceStartupError(
+                "工作区沙箱初始化失败，请检查 namespace、seccomp/AppArmor、系统路径挂载及运行依赖；详见 Terminal 日志",
+                exit_code=getattr(error, "exit_code", None),
             )
-        return fallback or "工作区启动失败，请查看 Terminal 日志"
+        if any(message in output for message in (
+            "modulenotfounderror:", "importerror:", "permissionerror:", "filenotfounderror:",
+        )):
+            return WorkspaceStartupError(
+                "工作区 Python 依赖或文件访问初始化失败，请查看 Terminal 日志",
+                exit_code=getattr(error, "exit_code", None),
+            )
+        return error if isinstance(error, WorkspaceStartupError) else WorkspaceStartupError(
+            str(error) or "工作区启动失败，请查看 Terminal 日志"
+        )
+
+    def startup_diagnostic(self):
+        text = self.stderr_tail.decode("utf-8", errors="replace")
+        for secret in (API_KEY, self.key):
+            if secret:
+                text = text.replace(secret, "[已隐藏]")
+        return text[-2048:]
 
     @property
     def socket(self):
@@ -79,15 +116,7 @@ class WorkspaceWorker:
 
     async def close(self):
         await self.client.aclose()
-        if self.process.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(self.process.pid, signal.SIGTERM)
-            try:
-                await asyncio.wait_for(self.process.wait(), 5)
-            except TimeoutError:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(self.process.pid, signal.SIGKILL)
-                await self.process.wait()
+        await _stop_process(self.process)
         if self.stderr_task is not None:
             await asyncio.wait({self.stderr_task}, timeout=0.5)
             if not self.stderr_task.done():
@@ -104,6 +133,8 @@ class WorkspaceManager:
             raise RuntimeError("工作区隔离需要 Linux 和 bubblewrap；不会降级为共享目录")
         if WORKSPACE_NETWORK not in ("isolated", "shared") or WORKSPACE_MAX_WORKERS < 1:
             raise RuntimeError("工作区网络必须为 isolated/shared，进程上限必须大于零")
+        if not math.isfinite(WORKSPACE_STARTUP_TIMEOUT) or WORKSPACE_STARTUP_TIMEOUT <= 0:
+            raise RuntimeError("工作区启动等待时间必须是大于零的有限秒数")
         self.root = Path(WORKSPACE_ROOT)
         if not self.root.is_absolute() or self.root == Path("/") or any(self.root == Path(path) or Path(path) in self.root.parents for path in (*_RUNTIME, "/etc", "/run", "/proc", "/dev")):
             raise RuntimeError("工作区根目录必须是独立的绝对路径")
@@ -214,7 +245,7 @@ class WorkspaceManager:
             if task is None:
                 if len(set(self.workers) | set(self.starting)) >= WORKSPACE_MAX_WORKERS and not await self._evict_idle():
                     raise RuntimeError("所有工作区均在使用，暂时无法分配新工作区；文件会保留")
-                task = asyncio.create_task(self._start(identity))
+                task = asyncio.create_task(self._start_with_retry(identity))
                 self.starting[workspace_key] = task
                 task.add_done_callback(lambda done: self._finished_start(workspace_key, done))
             self.waiters[workspace_key] = self.waiters.get(workspace_key, 0) + 1
@@ -229,44 +260,89 @@ class WorkspaceManager:
                 if task.done() and self.starting.get(workspace_key) is task:
                     del self.starting[workspace_key]
 
-    async def _start(self, identity):
-        workspace = self._workspace(identity)
-        runtime = tempfile.mkdtemp(prefix="open-terminal-worker-")
-        key = secrets.token_urlsafe(32)
-        command = self._command(workspace, runtime)
-        executable = sys.executable
-        if os.path.basename(executable) == "python3-ot":
-            executable = os.path.join(os.path.dirname(executable), "python3")
-        command += [executable, "-I", "-m", "open_terminal.workspace_worker"]
-        worker = None
+    async def _start_with_retry(self, identity):
+        deadline = time.monotonic() + WORKSPACE_STARTUP_TIMEOUT
+        first_error = None
+        for attempt in range(2):
+            try:
+                return await self._start(identity, deadline)
+            except WorkspaceStartupError as exc:
+                if attempt:
+                    raise WorkspaceStartupError(
+                        f"工作区重试启动失败：{exc}；首次失败：{first_error}",
+                        exit_code=exc.exit_code,
+                    ) from exc
+                if not exc.retryable or time.monotonic() + 0.5 >= deadline:
+                    raise
+                first_error = exc
+                log.warning("工作区就绪前退出，完成清理后重试一次；exit_code=%s", exc.exit_code)
+                await asyncio.sleep(0.5)
+
+    async def _start(self, identity, deadline=None):
+        deadline = deadline if deadline is not None else time.monotonic() + WORKSPACE_STARTUP_TIMEOUT
+        process = client = worker = runtime = None
         try:
+            workspace = self._workspace(identity)
+            runtime = tempfile.mkdtemp(prefix="open-terminal-worker-")
+            key = secrets.token_urlsafe(32)
+            command = self._command(workspace, runtime)
+            executable = sys.executable
+            if os.path.basename(executable) == "python3-ot":
+                executable = os.path.join(os.path.dirname(executable), "python3")
+            command += [executable, "-I", "-m", "open_terminal.workspace_worker"]
             process = await asyncio.create_subprocess_exec(*command, stdin=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env={}, start_new_session=True)
             client = httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=os.path.join(runtime, "worker.sock")), base_url="http://workspace", timeout=None, trust_env=False)
             worker = WorkspaceWorker(process, runtime, key, client, last_used=time.monotonic())
             worker.stderr_task = asyncio.create_task(worker.relay_stderr())
             import json
-            process.stdin.write(json.dumps(self._environment(workspace, key)).encode() + b"\n")
-            await process.stdin.drain()
-            process.stdin.close()
-            for _ in range(100):
+            try:
+                process.stdin.write(json.dumps(self._environment(workspace, key)).encode() + b"\n")
+                await asyncio.wait_for(process.stdin.drain(), max(0.001, deadline - time.monotonic()))
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except TimeoutError as exc:
+                raise WorkspaceStartupError("工作区初始化超时，请查看 Terminal 日志") from exc
+            finally:
+                process.stdin.close()
+            while time.monotonic() < deadline:
                 if process.returncode is not None:
-                    raise RuntimeError("工作区进程退出，请检查 namespace 权限及共享 Python 依赖路径")
+                    raise WorkspaceStartupError(
+                        f"工作区进程在就绪前退出（退出码 {process.returncode}），请查看 Terminal 日志",
+                        retryable=process.returncode not in (-signal.SIGKILL, 128 + signal.SIGKILL),
+                        exit_code=process.returncode,
+                    )
                 try:
-                    response = await client.get("/health", timeout=0.25)
+                    response = await client.get("/health", timeout=min(0.25, max(0.001, deadline - time.monotonic())))
                     if response.status_code == 200:
                         self.workers[identity.workspace_key] = worker
                         return worker
                 except httpx.TransportError:
                     pass
-                await asyncio.sleep(0.1)
-            raise RuntimeError("工作区启动超时，请检查 bubblewrap 和运行依赖")
+                await asyncio.sleep(min(0.1, max(0, deadline - time.monotonic())))
+            raise WorkspaceStartupError("工作区启动超时，请检查启动日志或调整 OPEN_TERMINAL_WORKSPACE_STARTUP_TIMEOUT")
         except BaseException as exc:
             if worker:
                 await worker.close()
             else:
-                shutil.rmtree(runtime, ignore_errors=True)
+                try:
+                    if client:
+                        await client.aclose()
+                finally:
+                    try:
+                        if process:
+                            await _stop_process(process)
+                    finally:
+                        if runtime:
+                            shutil.rmtree(runtime, ignore_errors=True)
             if worker and isinstance(exc, (OSError, RuntimeError)):
-                raise RuntimeError(worker.startup_error(str(exc))) from exc
+                error = worker.startup_error(exc)
+                log.warning("工作区启动失败；exit_code=%s；error=%s；stderr=%s", error.exit_code, error, worker.startup_diagnostic())
+                if error is exc:
+                    raise
+                raise error from exc
+            if worker is None and isinstance(exc, OSError):
+                log.warning("工作区进程创建失败；error=%s", exc)
+                raise WorkspaceStartupError("工作区进程创建失败，请检查磁盘、运行依赖和 Terminal 日志") from exc
             raise
 
     async def close(self):

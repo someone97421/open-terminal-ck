@@ -34,6 +34,7 @@
 OPEN_TERMINAL_WORKSPACE_ISOLATION=true
 OPEN_TERMINAL_WORKSPACE_ROOT=/workspaces
 OPEN_TERMINAL_WORKSPACE_MAX_WORKERS=32
+OPEN_TERMINAL_WORKSPACE_STARTUP_TIMEOUT=30
 OPEN_TERMINAL_WORKSPACE_NETWORK=isolated
 OPEN_TERMINAL_IMAGE_MAX_EDGE=2048
 OPEN_TERMINAL_IMAGE_MAX_BYTES=2097152
@@ -202,3 +203,15 @@ response = await send_guarded_model_request(
 - 图片与下游发送：`open_terminal/utils/image_context.py`、`open_terminal/integrations.py`。
 - 配置：`open_terminal/env.py`、`Dockerfile`、`Dockerfile.slim`、`Dockerfile.alpine`、`Dockerfile.openshift`。
 - 文档与定制登记：`README.md`、`AGENTS.md`、`docs/WORKSPACE_IMAGE_CONTEXT.md`。
+
+## 执行可靠性与冷启动恢复
+
+模型默认优先通过 `write_file` 创建文本文件，通过 `replace_file_content` 定点修改；文件工具按会话 cwd 解析相对路径，不假设 `/mnt/data` 可写。可选命令（例如 `apply_patch`）需先用 `command -v` 确认；命令 ID 或空输出不代表完成，应查询进程状态、退出码和预期产物。
+
+工作区就绪等待预算由 `OPEN_TERMINAL_WORKSPACE_STARTUP_TIMEOUT` 控制，默认 30 秒，使用单调时钟计时。健康检查成功后立即返回，正常启动不会额外等待满预算。只在共享冷启动任务内部对就绪前的非确定性早退恢复一次，退避 0.5 秒，两次尝试共用同一截止时间，失败实例先清理进程、连接与临时目录。截止后仍需完成资源回收，最终错误响应可能略晚于就绪截止时间。
+
+确定性的沙箱初始化、依赖缺失、文件访问初始化、超时、容量和路径校验错误不自动重试；被 SIGKILL 终止的进程也不立即重启。沙箱明确报告临时资源不可用时，保留早退错误原有的重试资格。业务 HTTP/WS 请求开始转发后不重放，避免重复执行命令或重复写入。启动失败记录退出码和至多 2 KiB 的脱敏 stderr 摘要，完整原始诊断仍沿用容器日志；二次失败同时保留首次错误，进程创建失败也记录日志。
+
+WebUI 获取会话目录和运行提示的默认请求超时为 45 秒，连接超时为 5 秒；读取项目 `AGENTS.md` 的整体等待预算也为 45 秒，为默认冷启动及后续清理留出余量。若提高 Terminal 启动上限，还需同步调整 WebUI 上下文等待预算。会话请求失败时不借用全局缓存中的其他工作区路径。`display_file` 的 `exists` 表示文件存在，WebUI 的 `displayed` 保留为正文内联标志，`display_mode` 区分 inline/viewer，均不构成客户端已经完成预览渲染的确认。
+
+本轮仅静态核对，尚未实测慢盘冷启动、并发恢复、取消清理及模型工具选择效果。

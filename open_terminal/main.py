@@ -137,14 +137,20 @@ def get_system_prompt() -> str:
         f"You have access to a computer running {platform.system()} {platform.release()} ({platform.machine()}) "
         f'on host "{socket.gethostname()}"{user_part} with {shell}. '
         f"Python {sys.version.split()[0]} is available.\n\n"
-        "Use your tools to directly interact with the system \u2014 run commands, read and write files, "
-        "and search the filesystem. "
-        "Prefer verifying the current state before making changes. "
-        "When running commands, check the output to confirm success. "
-        "If a command produces no output, that typically means it succeeded.\n\n"
-        "When delivering created or updated files to the user, call display_file for each deliverable "
-        "before your final response. Do not invent download links or use sandbox: URLs. "
-        "After displaying the files, briefly confirm completion without repeating links."
+        "Use write_file to create or overwrite text files and replace_file_content for targeted edits. "
+        "Prefer workspace-relative paths such as generated/poem.md; do not assume /mnt/data exists or is writable. "
+        "Use the current session directory reported by the tools; run pwd if it is unknown. "
+        f"This runtime's home directory is {json.dumps(os.path.expanduser('~'))}.\n\n"
+        "Use run_command for execution and processing. Check command -v before relying on optional utilities "
+        "such as apply_patch; if unavailable, use the file tools instead. "
+        "A command ID or empty output is not proof of success. If the command is still running, "
+        "use get_process_status to wait for completion and check exit_code; confirm expected files or output. "
+        "After a nonzero exit, inspect the actual error and change the approach rather than repeating it.\n\n"
+        "When delivering files, call display_file for each deliverable. exists=true confirms the file exists; "
+        "in WebUI, displayed=false can mean viewer mode rather than inline display and is not a creation error. "
+        "Do not claim that the client rendered a preview without confirmation. "
+        "Report file creation and presentation separately; do not recreate a confirmed file just to retry its preview. "
+        "Do not invent download links or use sandbox: URLs."
     )
 
     if OPEN_TERMINAL_INFO:
@@ -154,7 +160,10 @@ def get_system_prompt() -> str:
 
 
 _EXECUTE_DESCRIPTION = (
-    "Run a shell command in the background and return a command ID.\n\n"
+    "Run a shell command and return its process ID, status, and available output. "
+    "Use wait to allow short commands to finish; if still running, poll get_process_status and check exit_code. "
+    "An ID or empty output alone does not confirm success. Prefer write_file for text-file creation "
+    "and replace_file_content for edits. Check command -v before using optional tools such as apply_patch.\n\n"
     + get_system_info()
 )
 if EXECUTE_DESCRIPTION:
@@ -948,7 +957,7 @@ async def read_file(
     "/files/display",
     operation_id="display_file",
     summary="Display a file to the user",
-    description="Open a file in the user's file viewer so they can see it. Use this when the user wants to view or look at a file. This does not return file content to you — use read_file if you need to read the content yourself.",
+    description="Request a file preview for the user. This endpoint confirms the resolved path and whether the file exists; it does not confirm that the client rendered the preview. Use read_file to inspect contents.",
     dependencies=[Depends(verify_api_key)],
     responses={
         401: {"description": "Invalid or missing API key."},
@@ -956,7 +965,7 @@ async def read_file(
 )
 async def display_file(
     http_request: Request,
-    path: str = Query(..., description="Absolute path to the file to display."),
+    path: str = Query(..., description="Path to the file, relative to the current session working directory or an accessible absolute path."),
     fs: UserFS = Depends(get_filesystem),
 ):
     """Signal that a file should be displayed to the user.
@@ -1027,7 +1036,7 @@ async def serve_file(path: str, fs: UserFS = Depends(get_filesystem)):
     "/files/write",
     operation_id="write_file",
     summary="Write a file",
-    description="Write text content to a file. Creates parent directories automatically. Overwrites if the file already exists.",
+    description="Write text content directly to a file without shell quoting or external commands. Prefer this tool for creating text deliverables. Paths are relative to the current session working directory; do not assume /mnt/data is available. Creates parent directories automatically and overwrites existing files.",
     dependencies=[Depends(verify_api_key)],
     responses={
         401: {"description": "Invalid or missing API key."},
