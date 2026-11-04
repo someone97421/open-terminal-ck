@@ -52,6 +52,36 @@ class WorkspaceStartupError(RuntimeError):
         self.exit_code = exit_code
 
 
+class WorkspaceDeletedError(RuntimeError):
+    pass
+
+
+def _remove_workspace(path):
+    root = os.path.realpath(path)
+
+    def onerror(function, failed_path, exc_info):
+        error = exc_info[1]
+        if isinstance(error, FileNotFoundError):
+            return
+        if not isinstance(error, PermissionError):
+            raise error
+        for target in (os.path.dirname(failed_path), failed_path):
+            if target == os.path.dirname(root) or os.path.islink(target):
+                continue
+            if os.path.commonpath((root, os.path.realpath(target))) != root:
+                raise error
+            os.chmod(target, 0o700)
+        if function in (os.open, os.scandir, os.listdir):
+            shutil.rmtree(failed_path, onerror=onerror)
+        else:
+            function(failed_path)
+
+    if os.path.lexists(path):
+        if os.path.islink(path) or os.path.realpath(path) != path or os.path.ismount(path):
+            raise RuntimeError("项目工作区路径无效，未删除文件")
+        shutil.rmtree(path, onerror=onerror)
+
+
 async def _stop_process(process):
     if process.returncode is None:
         with contextlib.suppress(ProcessLookupError):
@@ -145,6 +175,7 @@ class WorkspaceManager:
         self.lock = asyncio.Lock()
         self.starting = {}
         self.waiters = {}
+        self.deleting = {}
         self.runtime_paths = []
         for value in WORKSPACE_RUNTIME_PATHS:
             path = Path(value)
@@ -159,7 +190,9 @@ class WorkspaceManager:
             if not any(path.startswith(root.rstrip("/") + "/") for root in visible):
                 raise RuntimeError(f"工作区内不可见 Python 解释器 {path}；请将其所在虚拟环境或前缀加入 OPEN_TERMINAL_WORKSPACE_RUNTIME_PATHS")
 
-    def _workspace(self, identity):
+    def _workspace(self, identity, *, allow_deleted=False):
+        if not allow_deleted:
+            self._check_deleted(identity)
         # 主进程只建立根下的哈希目录，不打开工作区内由命令控制的文件。
         user_hash, scope_hash = identity.directory_parts
         user_dir = self.root / user_hash
@@ -171,6 +204,59 @@ class WorkspaceManager:
         if workspace.is_symlink() or workspace.resolve() != workspace:
             raise RuntimeError("工作区目录无效")
         return str(workspace)
+
+    def _deletion_marker(self, identity):
+        user_hash, scope_hash = identity.directory_parts
+        return self.root / user_hash / f".{scope_hash}.deleted"
+
+    def _check_deleted(self, identity):
+        if identity.scope_type == "project" and (
+            identity.workspace_key in self.deleting or self._deletion_marker(identity).exists()
+        ):
+            raise WorkspaceDeletedError("项目工作区已删除或正在删除")
+
+    async def delete_project(self, identity):
+        if identity.scope_type != "project" or (identity.user_id != identity.owner_id and not identity.is_admin):
+            raise ValueError("只能由项目所属账号或管理员删除项目工作区")
+        workspace_key = identity.workspace_key
+        async with self.lock:
+            task = self.deleting.get(workspace_key)
+            if task is None:
+                workspace = self._workspace(identity, allow_deleted=True)
+                marker = self._deletion_marker(identity)
+                try:
+                    marker.touch(mode=0o600, exist_ok=False)
+                except FileExistsError:
+                    if marker.is_symlink() or not marker.is_file():
+                        raise RuntimeError("项目删除标记无效")
+                starting = self.starting.get(workspace_key)
+                if starting and not starting.done():
+                    starting.cancel()
+                worker = self.workers.get(workspace_key)
+                if worker:
+                    worker.draining = True
+                task = asyncio.create_task(self._delete_workspace(workspace_key, workspace, starting, worker))
+                self.deleting[workspace_key] = task
+                task.add_done_callback(lambda done: self._finished_delete(workspace_key, done))
+        await asyncio.shield(task)
+
+    def _finished_delete(self, workspace_key, task):
+        if self.deleting.get(workspace_key) is task:
+            del self.deleting[workspace_key]
+        if not task.cancelled():
+            task.exception()
+
+    async def _delete_workspace(self, workspace_key, workspace, starting, worker):
+        if starting:
+            results = await asyncio.gather(starting, return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException) and not isinstance(result, (asyncio.CancelledError, WorkspaceStartupError, WorkspaceDeletedError)):
+                    raise RuntimeError("项目启动进程清理失败，请重试删除") from result
+        if worker:
+            await worker.close()
+            if self.workers.get(workspace_key) is worker:
+                del self.workers[workspace_key]
+        await asyncio.to_thread(_remove_workspace, workspace)
 
     def _command(self, workspace, runtime):
         command = [shutil.which("bwrap"), "--die-with-parent", "--new-session", "--unshare-all", "--cap-drop", "ALL", "--clearenv"]
@@ -211,7 +297,7 @@ class WorkspaceManager:
     async def _evict_idle(self):
         candidates = sorted(self.workers.items(), key=lambda item: item[1].last_used)
         for identity, worker in candidates:
-            if worker.active or identity in self.starting:
+            if worker.active or worker.draining or identity in self.starting or identity in self.deleting:
                 continue
             try:
                 response = await worker.client.get("/api/workspace/idle", headers={"Authorization": f"Bearer {worker.key}"}, timeout=1)
@@ -228,17 +314,19 @@ class WorkspaceManager:
 
     async def get(self, identity):
         workspace_key = identity.workspace_key
+        self._check_deleted(identity)
         worker = self.workers.get(workspace_key)
         if worker and not worker.draining and worker.process.returncode is None:
             worker.active += 1
             return worker
         async with self.lock:
+            self._check_deleted(identity)
             worker = self.workers.get(workspace_key)
             if worker and not worker.draining and worker.process.returncode is None:
                 worker.active += 1
                 return worker
             for key, expired in list(self.workers.items()):
-                if expired.process.returncode is not None:
+                if expired.process.returncode is not None and key not in self.deleting:
                     await expired.close()
                     del self.workers[key]
             task = self.starting.get(workspace_key)
@@ -250,7 +338,14 @@ class WorkspaceManager:
                 task.add_done_callback(lambda done: self._finished_start(workspace_key, done))
             self.waiters[workspace_key] = self.waiters.get(workspace_key, 0) + 1
         try:
-            worker = await asyncio.shield(task)
+            try:
+                worker = await asyncio.shield(task)
+            except asyncio.CancelledError:
+                self._check_deleted(identity)
+                raise
+            self._check_deleted(identity)
+            if worker.draining:
+                raise WorkspaceDeletedError("项目工作区正在删除")
             worker.active += 1
             return worker
         finally:
@@ -314,7 +409,9 @@ class WorkspaceManager:
                 try:
                     response = await client.get("/health", timeout=min(0.25, max(0.001, deadline - time.monotonic())))
                     if response.status_code == 200:
-                        self.workers[identity.workspace_key] = worker
+                        async with self.lock:
+                            self._check_deleted(identity)
+                            self.workers[identity.workspace_key] = worker
                         return worker
                 except httpx.TransportError:
                     pass
@@ -334,6 +431,8 @@ class WorkspaceManager:
                     finally:
                         if runtime:
                             shutil.rmtree(runtime, ignore_errors=True)
+            if isinstance(exc, WorkspaceDeletedError):
+                raise
             if worker and isinstance(exc, (OSError, RuntimeError)):
                 error = worker.startup_error(exc)
                 log.warning("工作区启动失败；exit_code=%s；error=%s；stderr=%s", error.exit_code, error, worker.startup_diagnostic())
@@ -350,6 +449,7 @@ class WorkspaceManager:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*list(self.deleting.values()), return_exceptions=True)
         await asyncio.gather(*(worker.close() for worker in self.workers.values()))
         self.workers.clear()
 
@@ -385,8 +485,30 @@ class WorkspaceGateway:
             else:
                 await JSONResponse({"detail": str(exc)}, status_code=401)(scope, receive, send)
             return
+        deletion_request = kind == "http" and scope["method"] == "DELETE" and scope["path"] == "/api/workspace"
+        if identity.operation is not None or deletion_request:
+            if not deletion_request or identity.operation != "delete":
+                if kind == "websocket":
+                    await send({"type": "websocket.close", "code": 1008, "reason": "工作区操作签名不匹配"})
+                else:
+                    await JSONResponse({"detail": "工作区操作签名不匹配"}, status_code=403)(scope, receive, send)
+                return
+            try:
+                await self.manager.delete_project(identity)
+            except (OSError, RuntimeError, ValueError):
+                log.exception("项目工作区删除未完成")
+                await JSONResponse({"detail": "工作区文件清理未完成，请检查 Terminal 日志后重试删除"}, status_code=503)(scope, receive, send)
+                return
+            await JSONResponse({"deleted": True, "project_id": identity.scope_id})(scope, receive, send)
+            return
         try:
             worker = await self.manager.get(identity)
+        except WorkspaceDeletedError as exc:
+            if kind == "websocket":
+                await send({"type": "websocket.close", "code": 1008, "reason": str(exc)})
+            else:
+                await JSONResponse({"detail": str(exc)}, status_code=410)(scope, receive, send)
+            return
         except (OSError, RuntimeError) as exc:
             if kind == "websocket":
                 await send({"type": "websocket.close", "code": 1013, "reason": "工作区不可用"})

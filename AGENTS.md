@@ -39,7 +39,7 @@
 | 同步追踪记录 | `docs/UPSTREAM_SYNC.md` | 增量同步与暂缓项依据 | 与上游同名文件冲突时以本地记录为准 |
 | 精简流水线 | `.github/workflows/ci.yml` | 仅保留代码检查与镜像构建验证 | 上游新增或改动 workflows 时不引入发布、签名、部署步骤 |
 | 分发方式 | `README.md`、`pyproject.toml` | 不发布镜像与包 | 上游 README 更新时保留本地构建说明，不恢复镜像仓库与包管理平台引用 |
-| 对话与项目工作区隔离 | `open_terminal/workspaces.py`、`workspace_worker.py`、`workspace_context.py`、`dependencies.py`、`utils/fs.py`、`main.py` | 独立聊天隔离、项目多聊天共享文件、只读依赖共用 | 保留 v1 目录兼容、v2 owner＋project 调度、真实 chat 会话身份及 WebUI 按次签名；保留整工作进程沙箱，不退回仅 cwd 隔离 |
+| 对话与项目工作区隔离 | `open_terminal/workspaces.py`、`workspace_worker.py`、`workspace_context.py`、`dependencies.py`、`utils/fs.py`、`main.py` | 普通账号隔离、同一账号项目多聊天共享文件、管理员跨账号管理、只读依赖共用 | 保留 v1 目录兼容、v2 owner＋project 调度；普通用户要求 user==owner，管理员凭已验签的 admin:true 保留跨账号管理权，目录仍按实际 owner 选择；保留真实 chat 会话身份及 WebUI 按次签名；项目删除需所属账号或管理员的 delete 操作签名，先停进程再清理目录，并保留删除标记阻止旧请求重建；保留整工作进程沙箱，不退回仅 cwd 隔离 |
 | 模型图片网关 | `open_terminal/utils/image_context.py`、`integrations.py`、`main.py`、`utils/notebooks.py`、`docs/WORKSPACE_IMAGE_CONTEXT.md` | 大图受限预览、原图保留与 OpenWebUI 接入 | 保留所有读图及最终发送校验，不恢复模型直接读取原图的路径 |
 
 ## 6. 上游同步固定流程

@@ -20,7 +20,7 @@
 
 原始标识不作为目录名，使用完整哈希。已有上传、写入和执行接口仍可以选择工作区内部的任意子目录；这些子目录是默认整理结构，不强制重命名用户文件。`/files/cwd` 设置的目录持久化到各自的 `cache/cwd.json`，无效或已删除时退回工作区根。普通 shell 的 `cd` 仍只影响该 shell；跨工具修改默认目录使用现有的 cwd 接口。
 
-项目使用 `/workspaces/<SHA256(owner_id)>/project-<SHA256(project_id)>/`，共享该项目的聊天和成员复用同一工作进程。共享的 `AGENTS.md` 位于项目根目录；`X-Session-Id` 仍为真实聊天 ID，shell/notebook 会话仍按用户与聊天区分。项目归档只限制 WebUI 的新请求，不删除目录；服务端不自行清理项目文件。v1 聊天目录完全兼容，不自动迁移旧数据。
+项目使用 `/workspaces/<SHA256(owner_id)>/project-<SHA256(project_id)>/`，同一账号在同一项目内的聊天复用同一工作进程；普通用户按账号隔离，管理员保留跨账号管理权，目录始终属于项目实际 owner。共享的 `AGENTS.md` 位于项目根目录；`X-Session-Id` 仍为真实聊天 ID，shell/notebook 会话仍按用户与聊天区分。项目归档只限制 WebUI 的新请求，不删除目录；服务端不自行清理项目文件。v1 聊天目录完全兼容，不自动迁移旧数据。
 
 `/usr`、`/bin`、`/sbin`、`/lib`、`/lib64` 只读共享，`/etc` 仅挂载证书、动态链接、字体、账号名称和名称解析等必要项；不挂载宿主 `/home`、`/root`、Docker socket、sudoers 或主服务状态目录。每个工作区使用独立的 PID、IPC、挂载及默认网络命名空间。`TMPDIR` 指向工作区的 `tmp/`，缓存及日志也保存在自己的工作区；硬编码 `/tmp` 的程序使用独立的临时视图，该部分不跨进程重启保留。工作进程通信 socket 位于临时运行目录。
 
@@ -110,7 +110,7 @@ WebUI 的原生 Bearer 终端连接在携带有效聊天身份时统一签名，
 - `payload = {"v":1,"user":<user_id>,"chat":<chat_id>,"exp":<unix 秒>}`，JSON 紧凑序列化（`separators=(",",":")`，`ensure_ascii=False`），UTF-8 编码。
 - `X-Workspace-Context = base64url(payload)` 去掉末尾 `=`。
 - `X-Workspace-Signature = hex(HMAC-SHA256(key=现有 API Key, msg="open-terminal/workspace/v1" + "\0" + X-Workspace-Context))`。
-- 项目 v2 的 payload 为 `{"v":2,"user":<当前用户>,"chat":<真实聊天>,"scope_type":"project","scope_id":<项目ID>,"owner":<项目所有者>,"exp":<unix秒>}`；签名前缀改为 `open-terminal/workspace/v2`，编码及请求头校验相同。可信接入端必须查验项目和聊天真实归属，不能接受客户端指定 owner/scope。`sign_workspace_context` 支持相应关键字参数；原有 `integrations.workspace_headers` 仍用于 v1 聊天。
+- 项目 v2 的 payload 为 `{"v":2,"user":<当前用户>,"chat":<真实聊天>,"scope_type":"project","scope_id":<项目ID>,"owner":<项目所有者>,"exp":<unix秒>}`；管理员管理项目时增加 `"admin":true`，包括删除签名，owner 仍指向实际项目所属账号。签名前缀改为 `open-terminal/workspace/v2`，编码及请求头校验相同。可信接入端必须查验项目和聊天真实归属及管理员身份，不能接受客户端指定 owner/scope/admin。`sign_workspace_context` 支持相应关键字参数及 `is_admin=False`；原有 `integrations.workspace_headers` 仍用于 v1 聊天。
 - 项目设置使用可信 WebUI 内部的 `project:<id>` session 读写根目录 `AGENTS.md`；此上下文不由浏览器直接签发，不占用真实聊天的实时会话。
 - `exp` 必须晚于当前时间且不超过当前时间 + 300 秒（另容忍 60 秒时钟偏差）；用户与对话标识为非空字符串、各不超过 1024 字节，且须能作为 latin-1 HTTP 头值发送（OpenWebUI 的 UUID 满足）。
 
@@ -215,3 +215,15 @@ response = await send_guarded_model_request(
 WebUI 获取会话目录和运行提示的默认请求超时为 45 秒，连接超时为 5 秒；读取项目 `AGENTS.md` 的整体等待预算也为 45 秒，为默认冷启动及后续清理留出余量。若提高 Terminal 启动上限，还需同步调整 WebUI 上下文等待预算。会话请求失败时不借用全局缓存中的其他工作区路径。`display_file` 的 `exists` 表示文件存在，WebUI 的 `displayed` 保留为正文内联标志，`display_mode` 区分 inline/viewer，均不构成客户端已经完成预览渲染的确认。
 
 本轮仅静态核对，尚未实测慢盘冷启动、并发恢复、取消清理及模型工具选择效果。
+
+## 项目完整删除
+
+隔离网关处理 `DELETE /api/workspace`，此管理接口不加入模型工具的 OpenAPI。请求需要原有 Bearer 密钥及 v2 项目签名，签名载荷须含 `scope_type=project`、`operation=delete` 与 `chat=project:<scope_id>`，且满足 `user=owner` 或已验签的 `admin=true`；普通会话签名或普通项目读写签名不能发起删除。`/api/config` 的 `workspace_context.operations` 声明 `delete` 能力。
+
+所有 v2 项目请求（包含文件、执行和删除）均要求 `user == owner`，或由可信接入端在签名内声明 `admin:true`。`admin` 出现时必须是布尔值且只允许用于 v2，网关通过 HMAC 验签后才认可管理员权限。普通用户的项目和工作区按账号隔离，同一账号在同一项目内的聊天共用工作区；管理员保留跨账号管理权，包括删除。
+
+目录仍由 `sha256(owner)` 与 `project-sha256(scope_id)` 生成，不接收客户端磁盘路径。管理器先在项目挂载范围之外创建持久删除标记，阻止旧请求重建；随后取消并等待冷启动任务、关闭目标 worker 及其进程，再删除该项目目录。删除共享同一任务，取消请求连接不会中断清理；服务正常退出时等待清理完成。已存在文件内的符号链接不作为目录跟随，遇到只读目录在范围内修复权限后清理，不删除其他工作区或共享依赖。
+
+删除成功返回 `{"deleted":true,"project_id":"项目 ID"}`，重复删除可再次确认成功；旧请求访问被标记的项目返回 HTTP 410，WebSocket 关闭。清理失败会返回 503 并保留删除标记，允许同一删除请求重试，不能恢复已清理的文件。项目数据目录会移除，仅留工作区外的服务端标记，重启后继续阻止旧签名请求复活目录。
+
+本功能仅完成静态核对，实际 NAS 上的进程中止、只读目录清理、并发删除和失败重试尚未运行验证。

@@ -550,7 +550,7 @@ async def get_config():
             "workspace_isolation": WORKSPACE_ISOLATION,
             "project_workspaces": WORKSPACE_ISOLATION,
         },
-        **({"workspace_context": {"protocol": WORKSPACE_CONTEXT_PROTOCOL, "version": 1, "protocols": [WORKSPACE_CONTEXT_PROTOCOL, PROJECT_PROTOCOL], "scopes": ["chat", "project"], "algorithm": "HMAC-SHA256", "max_ttl": 300}} if WORKSPACE_ISOLATION else {}),
+        **({"workspace_context": {"protocol": WORKSPACE_CONTEXT_PROTOCOL, "version": 1, "protocols": [WORKSPACE_CONTEXT_PROTOCOL, PROJECT_PROTOCOL], "scopes": ["chat", "project"], "operations": ["delete"], "algorithm": "HMAC-SHA256", "max_ttl": 300}} if WORKSPACE_ISOLATION else {}),
     }
 
 
