@@ -50,6 +50,28 @@ class WorkspaceWorker:
     active: int = 0
     last_used: float = 0
     draining: bool = False
+    stderr_task: asyncio.Task | None = None
+    stderr_tail: bytes = b""
+
+    async def relay_stderr(self):
+        while chunk := await self.process.stderr.read(4096):
+            self.stderr_tail = (self.stderr_tail + chunk)[-8192:]
+            with contextlib.suppress(OSError, ValueError):
+                sys.stderr.write(chunk.decode("utf-8", errors="replace"))
+                sys.stderr.flush()
+
+    def startup_error(self, fallback):
+        output = self.stderr_tail.decode("utf-8", errors="replace").lower()
+        if "bwrap:" in output and any(message in output for message in (
+            "no permissions to create a new namespace",
+            "creating new namespace failed",
+            "setting up uid map",
+        )):
+            return (
+                "工作区启动失败：宿主拒绝创建 Linux namespace。请检查 Docker 的 seccomp/AppArmor "
+                "策略及宿主内核的 user namespace 支持；修改 API Key 或关闭工作区隔离不能修复此问题"
+            )
+        return fallback or "工作区启动失败，请查看 Terminal 日志"
 
     @property
     def socket(self):
@@ -66,6 +88,11 @@ class WorkspaceWorker:
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(self.process.pid, signal.SIGKILL)
                 await self.process.wait()
+        if self.stderr_task is not None:
+            await asyncio.wait({self.stderr_task}, timeout=0.5)
+            if not self.stderr_task.done():
+                self.stderr_task.cancel()
+            await asyncio.gather(self.stderr_task, return_exceptions=True)
         shutil.rmtree(self.runtime, ignore_errors=True)
 
 
@@ -213,9 +240,10 @@ class WorkspaceManager:
         command += [executable, "-I", "-m", "open_terminal.workspace_worker"]
         worker = None
         try:
-            process = await asyncio.create_subprocess_exec(*command, stdin=asyncio.subprocess.PIPE, env={}, start_new_session=True)
+            process = await asyncio.create_subprocess_exec(*command, stdin=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env={}, start_new_session=True)
             client = httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=os.path.join(runtime, "worker.sock")), base_url="http://workspace", timeout=None, trust_env=False)
             worker = WorkspaceWorker(process, runtime, key, client, last_used=time.monotonic())
+            worker.stderr_task = asyncio.create_task(worker.relay_stderr())
             import json
             process.stdin.write(json.dumps(self._environment(workspace, key)).encode() + b"\n")
             await process.stdin.drain()
@@ -232,11 +260,13 @@ class WorkspaceManager:
                     pass
                 await asyncio.sleep(0.1)
             raise RuntimeError("工作区启动超时，请检查 bubblewrap 和运行依赖")
-        except BaseException:
+        except BaseException as exc:
             if worker:
                 await worker.close()
             else:
                 shutil.rmtree(runtime, ignore_errors=True)
+            if worker and isinstance(exc, (OSError, RuntimeError)):
+                raise RuntimeError(worker.startup_error(str(exc))) from exc
             raise
 
     async def close(self):

@@ -31,7 +31,9 @@ from PIL import Image, ImageOps
 
 
 _CACHE_VERSION = 1
-_INPUT_FORMATS = ("JPEG", "MPO", "PNG", "WEBP", "GIF", "BMP", "TIFF")
+_OPEN_FORMATS = ("JPEG", "PNG", "WEBP", "GIF", "BMP", "TIFF")
+# MPO 由 JPEG 插件识别，不是独立的打开插件。
+_INPUT_FORMATS = (*_OPEN_FORMATS, "MPO")
 _IMAGE_MIMES = frozenset(
     {"image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif", "image/bmp", "image/tiff"}
 )
@@ -170,12 +172,12 @@ class ImageContextGateway:
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("error", Image.DecompressionBombWarning)
-                with Image.open(io.BytesIO(raw), formats=_INPUT_FORMATS) as probe:
+                with Image.open(io.BytesIO(raw), formats=_OPEN_FORMATS) as probe:
                     if probe.format not in _INPUT_FORMATS:
                         raise ImageContextError("不支持该图片的实际编码格式")
                     self._check_dimensions(probe.size)
                     probe.verify()
-                with Image.open(io.BytesIO(raw), formats=_INPUT_FORMATS) as source:
+                with Image.open(io.BytesIO(raw), formats=_OPEN_FORMATS) as source:
                     self._check_dimensions(source.size)
                     source.seek(0)
                     source.load()

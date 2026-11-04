@@ -43,7 +43,7 @@ from open_terminal.utils.file_compare import CompareRequest, run_comparison
 from open_terminal.utils.git import GitRepository
 from open_terminal.utils.events import system_events
 from open_terminal.utils.search import search_entries, matching_files, ranked_page
-from open_terminal.utils.image_context import ImageContextGateway, ImageContextError, _INPUT_FORMATS
+from open_terminal.utils.image_context import ImageContextGateway, ImageContextError, _OPEN_FORMATS
 from open_terminal.utils.skills import join_skill_path, list_skill_resources, parse_skill_frontmatter
 
 image_gateway = ImageContextGateway(max_edge=IMAGE_MAX_EDGE, max_bytes=IMAGE_MAX_BYTES, max_pixels=IMAGE_MAX_PIXELS)
@@ -56,7 +56,7 @@ def _image_file(path: str, mime: str) -> bool:
         return True
     from PIL import Image, UnidentifiedImageError
     try:
-        with Image.open(path, formats=_INPUT_FORMATS):
+        with Image.open(path, formats=_OPEN_FORMATS):
             return True
     except UnidentifiedImageError:
         return False

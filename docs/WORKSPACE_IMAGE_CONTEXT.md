@@ -40,7 +40,26 @@ OPEN_TERMINAL_IMAGE_MAX_BYTES=2097152
 OPEN_TERMINAL_IMAGE_MAX_PIXELS=40000000
 ```
 
-四种 Dockerfile 均安装 bubblewrap，并预建可写 `/workspaces`。镜像和目标平台没有经过本次构建或运行验证。容器运行策略必须允许 bubblewrap 创建 user/mount/pid/network namespace；Docker 的 seccomp、AppArmor 或 OpenShift restricted SCC 可能阻止这些操作。安装了 bubblewrap 不等于宿主允许执行。失败时启动或首个工作区请求会明确报错/503，不会退回共享目录；查看前台终端中的诊断。应按宿主策略开放必要的 namespace 能力，不要求全面开放容器特权。
+四种 Dockerfile 均安装 bubblewrap，并预建可写 `/workspaces`。容器运行策略必须允许 bubblewrap 创建 user/mount/pid/network namespace 及挂载工作区内的 `/proc`；Docker 的 seccomp、AppArmor、系统路径遮罩或 OpenShift restricted SCC 可能阻止这些操作。安装了 bubblewrap 不等于宿主允许执行。失败时启动或首个工作区请求会明确报错/503，不会退回共享目录；查看容器日志中的诊断。
+
+若日志出现 `bwrap: No permissions to create a new namespace`，但 `/api/config` 正常、文件与执行接口返回 503，请先核对宿主的 `user.max_user_namespaces`、存在时的 `kernel.unprivileged_userns_clone` 及内核 `CONFIG_USER_NS`。缺少某一 sysctl 项本身不代表不支持 user namespace。
+
+在 NAS 的 Linux 6.12.30+、Docker 26.1.0、Compose v2.26.1 上，独立探测已确认 seccomp 和 AppArmor 均参与阻断；仅解除这两项仍会因 `/proc` 挂载被拒而失败。以下是该环境中已验证可启动真实工作进程的策略组合：
+
+```yaml
+security_opt:
+  - seccomp=unconfined
+  - apparmor=unconfined
+  - systempaths=unconfined
+```
+
+这会取消外层容器的 seccomp/AppArmor 策略及默认系统路径遮罩、只读限制，明显放宽外层保护；不修改 Key、工作区目录或应用内的 bubblewrap 隔离，也未使用 `privileged` 或额外 `SYS_ADMIN`。这里的“已验证”限定为探测过的策略组合，不代表不存在更精细的规则。
+
+`systempaths=unconfined` 可能不出现在 `docker inspect` 的 `SecurityOpt` 数组中，应检查实际的 `MaskedPaths=[]` 和 `ReadonlyPaths=[]`。该 NAS 的 Compose 已验证能正确应用；其他平台需自行确认，不能仅凭参数被接受就认定生效。若内核缺少 user namespace 能力，这些选项仍无法补足。
+
+实测通过工作进程健康检查、cwd、临时文件写入、列目录与 Python 命令执行；旧镜像的文本读取在图片识别阶段暴露 `KeyError: 'MPO'`，源码已将打开插件列表与可接受格式分开，修复仍待新镜像复测。生产项目签名、网关转发及 WebSocket 尚未验证。
+
+工作进程启动失败会持续输出原始 stderr 到容器日志，并保留最多 8 KiB 尾部用于错误分类；命名空间权限失败通过 HTTP 503 返回可读诊断。WebSocket 在 accept 前遇到同类失败会表现为握手 403，不能单凭该状态认定 Key 错误。
 
 在已有本地镜像上使用持久卷的前台运行示例：
 
