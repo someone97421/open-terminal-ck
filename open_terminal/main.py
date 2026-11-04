@@ -138,7 +138,7 @@ def get_system_prompt() -> str:
         f'on host "{socket.gethostname()}"{user_part} with {shell}. '
         f"Python {sys.version.split()[0]} is available.\n\n"
         "Use write_file to create or overwrite text files and replace_file_content for targeted edits. "
-        "Prefer workspace-relative paths such as generated/poem.md; do not assume /mnt/data exists or is writable. "
+        "Relative file paths use the current session directory; do not assume /mnt/data exists or is writable. "
         "Use the current session directory reported by the tools; run pwd if it is unknown. "
         f"This runtime's home directory is {json.dumps(os.path.expanduser('~'))}.\n\n"
         "Use run_command for execution and processing. Check command -v before relying on optional utilities "
@@ -161,6 +161,7 @@ def get_system_prompt() -> str:
 
 _EXECUTE_DESCRIPTION = (
     "Run a shell command and return its process ID, status, and available output. "
+    "Each call starts a new shell in cwd or the current session directory; cd affects only that command. "
     "Use wait to allow short commands to finish; if still running, poll get_process_status and check exit_code. "
     "An ID or empty output alone does not confirm success. Prefer write_file for text-file creation "
     "and replace_file_content for edits. Check command -v before using optional tools such as apply_patch.\n\n"
@@ -266,7 +267,7 @@ async def permission_error_handler(request: Request, exc: PermissionError):
 
 @app.exception_handler(ImageContextError)
 async def image_error_handler(request: Request, exc: ImageContextError):
-    return JSONResponse(status_code=415, content={"detail": str(exc)})
+    return JSONResponse(status_code=415, content={"detail": str(exc), "code": exc.code, **({"size_bytes": exc.size_bytes} if exc.size_bytes is not None else {})})
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +283,7 @@ class ExecRequest(BaseModel):
     )
     cwd: Optional[str] = Field(
         None,
-        description="Working directory for the command. Defaults to the server's current directory if not set.",
+        description="命令工作目录；相对路径以当前会话目录解析，省略时使用当前会话目录。每次调用创建独立 shell，命令中的 cd 或此参数均不改变后续工具的默认目录。",
     )
     env: Optional[dict[str, str]] = Field(
         None,
@@ -438,7 +439,7 @@ def _get_session_cwd(session_id: str | None, fs: "UserFS") -> str:
     key = (fs.home, session_id)
     if session_id and key in _session_cwds:
         cwd, _ = _session_cwds[key]
-        if fs.workspace_root and (not fs.is_path_allowed(cwd) or not os.path.isdir(cwd)):
+        if not fs.is_path_allowed(cwd) or not os.path.isdir(cwd):
             del _session_cwds[key]
             return fs.load_cwd()
         _session_cwds[key] = (cwd, time.time())  # refresh TTL
@@ -650,7 +651,7 @@ async def set_cwd(
     fs: UserFS = Depends(get_filesystem),
 ):
     session_id = http_request.headers.get("x-session-id")
-    target = fs.resolve_path(request.path)
+    target = fs.resolve_path(request.path, cwd=_get_session_cwd(http_request.headers.get("x-session-id"), fs))
     if not await fs.isdir(target):
         raise HTTPException(status_code=404, detail="Directory not found")
     _set_session_cwd(session_id, target, fs)
@@ -730,7 +731,7 @@ async def list_files(
     fs: UserFS = Depends(get_filesystem),
 ):
     session_id = http_request.headers.get("x-session-id")
-    session_cwd = _get_session_cwd(session_id, fs) if session_id else None
+    session_cwd = _get_session_cwd(session_id, fs)
     target = fs.resolve_path(directory, cwd=session_cwd)
     if not await fs.isdir(target):
         raise HTTPException(status_code=404, detail="Directory not found")
@@ -883,7 +884,7 @@ async def git_action(http_request: Request, action: str, payload: GitActionReque
 @app.post("/files/compare", dependencies=[Depends(verify_api_key)], include_in_schema=False)
 async def compare_files(http_request: Request, payload: CompareRequest, fs: UserFS = Depends(get_filesystem)):
     session_id = http_request.headers.get("x-session-id")
-    cwd = _get_session_cwd(session_id, fs) if session_id else None
+    cwd = _get_session_cwd(session_id, fs)
     return await run_comparison(http_request, payload, fs, cwd)
 
 
@@ -912,7 +913,7 @@ async def read_file(
     fs: UserFS = Depends(get_filesystem),
 ):
     session_id = http_request.headers.get("x-session-id")
-    session_cwd = _get_session_cwd(session_id, fs) if session_id else None
+    session_cwd = _get_session_cwd(session_id, fs)
     target = fs.resolve_path(path, cwd=session_cwd)
     if not await fs.isfile(target):
         raise HTTPException(status_code=404, detail="File not found")
@@ -923,7 +924,11 @@ async def read_file(
     if await run_io(_image_file, target, mime):
         cache = fs.resolve_path(os.path.join(fs.home, "cache" if fs.workspace_root else ".cache/open-terminal", "image-context"))
         preview = await run_io(image_gateway.preview_file, target, cache, crop)
-        return Response(preview.data, media_type=preview.mime, headers={"X-Image-Width": str(preview.width), "X-Image-Height": str(preview.height), "Cache-Control": "no-store"})
+        return Response(preview.data, media_type=preview.mime, headers={
+            "X-Image-Width": str(preview.width), "X-Image-Height": str(preview.height),
+            "X-File-Path": url_quote(target, safe=""), "X-File-Size": str(os.path.getsize(target)),
+            "Cache-Control": "no-store",
+        })
     if crop is not None:
         raise HTTPException(415, "crop 仅适用于可解析的图片")
     try:
@@ -976,7 +981,7 @@ async def display_file(
     opening a preview pane, launching a viewer, etc.).
     """
     session_id = http_request.headers.get("x-session-id")
-    session_cwd = _get_session_cwd(session_id, fs) if session_id else None
+    session_cwd = _get_session_cwd(session_id, fs)
     target = fs.resolve_path(path, cwd=session_cwd)
     exists = await fs.isfile(target)
     return {"path": target, "exists": exists}
@@ -988,6 +993,7 @@ async def display_file(
     dependencies=[Depends(verify_api_key)],
 )
 async def view_file(
+    http_request: Request,
     path: str = Query(..., description="Path to the file to view."),
     preview: bool = Query(False, description="Return a best-effort rendered preview when available."),
     fs: UserFS = Depends(get_filesystem),
@@ -997,7 +1003,7 @@ async def view_file(
     Unlike read_file (which is designed for LLM consumption and restricts
     binary types), this endpoint serves any file as-is for UI previewing.
     """
-    target = fs.resolve_path(path)
+    target = fs.resolve_path(path, cwd=_get_session_cwd(http_request.headers.get("x-session-id"), fs))
     if not await fs.isfile(target):
         raise HTTPException(status_code=404, detail="File not found")
 
@@ -1027,9 +1033,9 @@ async def view_file(
     include_in_schema=False,
     dependencies=[Depends(verify_api_key)],
 )
-async def serve_file(path: str, fs: UserFS = Depends(get_filesystem)):
+async def serve_file(http_request: Request, path: str, fs: UserFS = Depends(get_filesystem)):
     """Path-based alias for view_file — enables relative URL resolution in iframes."""
-    return await view_file(path=f"/{path}", preview=False, fs=fs)
+    return await view_file(http_request, path=f"/{path}", preview=False, fs=fs)
 
 
 @app.post(
@@ -1044,7 +1050,7 @@ async def serve_file(path: str, fs: UserFS = Depends(get_filesystem)):
 )
 async def write_file(http_request: Request, request: WriteRequest, fs: UserFS = Depends(get_filesystem)):
     session_id = http_request.headers.get("x-session-id")
-    session_cwd = _get_session_cwd(session_id, fs) if session_id else None
+    session_cwd = _get_session_cwd(session_id, fs)
     target = fs.resolve_path(request.path, cwd=session_cwd)
     try:
         await fs.write(target, request.content)
@@ -1058,8 +1064,8 @@ async def write_file(http_request: Request, request: WriteRequest, fs: UserFS = 
     include_in_schema=False,
     dependencies=[Depends(verify_api_key)],
 )
-async def mkdir(request: MkdirRequest, fs: UserFS = Depends(get_filesystem)):
-    target = fs.resolve_path(request.path)
+async def mkdir(http_request: Request, request: MkdirRequest, fs: UserFS = Depends(get_filesystem)):
+    target = fs.resolve_path(request.path, cwd=_get_session_cwd(http_request.headers.get("x-session-id"), fs))
     try:
         await fs.mkdir(target)
     except (OSError, subprocess.CalledProcessError) as e:
@@ -1073,10 +1079,11 @@ async def mkdir(request: MkdirRequest, fs: UserFS = Depends(get_filesystem)):
     dependencies=[Depends(verify_api_key)],
 )
 async def delete_entry(
+    http_request: Request,
     path: str = Query(..., description="Path to delete."),
     fs: UserFS = Depends(get_filesystem),
 ):
-    target = fs.resolve_path(path)
+    target = fs.resolve_path(path, cwd=_get_session_cwd(http_request.headers.get("x-session-id"), fs))
     if not await fs.exists(target):
         raise HTTPException(status_code=404, detail="Path not found")
     is_dir = await fs.isdir(target)
@@ -1092,9 +1099,10 @@ async def delete_entry(
     include_in_schema=False,
     dependencies=[Depends(verify_api_key)],
 )
-async def move_entry(request: MoveRequest, fs: UserFS = Depends(get_filesystem)):
-    source = fs.resolve_path(request.source)
-    destination = fs.resolve_path(request.destination)
+async def move_entry(http_request: Request, request: MoveRequest, fs: UserFS = Depends(get_filesystem)):
+    cwd = _get_session_cwd(http_request.headers.get("x-session-id"), fs)
+    source = fs.resolve_path(request.source, cwd=cwd)
+    destination = fs.resolve_path(request.destination, cwd=cwd)
 
     if not await fs.exists(source):
         raise HTTPException(status_code=404, detail="Source path not found")
@@ -1127,7 +1135,7 @@ async def move_entry(request: MoveRequest, fs: UserFS = Depends(get_filesystem))
 )
 async def replace_file_content(http_request: Request, request: ReplaceRequest, fs: UserFS = Depends(get_filesystem)):
     session_id = http_request.headers.get("x-session-id")
-    session_cwd = _get_session_cwd(session_id, fs) if session_id else None
+    session_cwd = _get_session_cwd(session_id, fs)
     target = fs.resolve_path(request.path, cwd=session_cwd)
     if not await fs.isfile(target):
         raise HTTPException(status_code=404, detail="File not found")
@@ -1204,7 +1212,7 @@ async def grep_search(
     fs: UserFS = Depends(get_filesystem),
 ):
     session_id = http_request.headers.get("x-session-id")
-    session_cwd = _get_session_cwd(session_id, fs) if session_id else None
+    session_cwd = _get_session_cwd(session_id, fs)
     target = fs.resolve_path(path, cwd=session_cwd)
     if not await aiofiles.os.path.exists(target):
         raise HTTPException(status_code=404, detail="Search path not found")
@@ -1315,7 +1323,7 @@ async def match_files(
         raise HTTPException(status_code=400, detail="Query must not be blank")
 
     session_id = http_request.headers.get("x-session-id")
-    session_cwd = _get_session_cwd(session_id, fs) if session_id else None
+    session_cwd = _get_session_cwd(session_id, fs)
     target = fs.resolve_path(path, cwd=session_cwd)
     if not fs.is_path_allowed(target) or not await aiofiles.os.path.isdir(target):
         raise HTTPException(status_code=404, detail="Search directory not found")
@@ -1395,7 +1403,7 @@ async def search_files(
     fs: UserFS = Depends(get_filesystem),
 ):
     session_id = http_request.headers.get("x-session-id")
-    session_cwd = _get_session_cwd(session_id, fs) if session_id else None
+    session_cwd = _get_session_cwd(session_id, fs)
     target = fs.resolve_path(path, cwd=session_cwd)
     if not fs.is_path_allowed(target) or not await aiofiles.os.path.isdir(target):
         raise HTTPException(status_code=404, detail="Search directory not found")
@@ -1452,7 +1460,7 @@ async def glob_search(
     fs: UserFS = Depends(get_filesystem),
 ):
     session_id = http_request.headers.get("x-session-id")
-    session_cwd = _get_session_cwd(session_id, fs) if session_id else None
+    session_cwd = _get_session_cwd(session_id, fs)
     target = fs.resolve_path(path, cwd=session_cwd)
     if not await aiofiles.os.path.isdir(target):
         raise HTTPException(status_code=404, detail="Search directory not found")
@@ -1576,7 +1584,7 @@ async def upload_file(
         await form.close()
         raise
     filename = os.path.basename(file.filename or "upload")
-    directory = fs.resolve_path(directory)
+    directory = fs.resolve_path(directory, cwd=_get_session_cwd(http_request.headers.get("x-session-id"), fs))
     path = os.path.normpath(os.path.join(directory, filename))
     size = 0
     try:
@@ -1609,6 +1617,7 @@ class ArchiveRequest(BaseModel):
     dependencies=[Depends(verify_api_key)],
 )
 async def archive_paths(
+    http_request: Request,
     request: ArchiveRequest,
     fs: UserFS = Depends(get_filesystem),
 ):
@@ -1619,8 +1628,9 @@ async def archive_paths(
         raise HTTPException(status_code=400, detail="No paths provided")
 
     resolved = []
+    cwd = _get_session_cwd(http_request.headers.get("x-session-id"), fs)
     for p in request.paths:
-        target = fs.resolve_path(p)
+        target = fs.resolve_path(p, cwd=cwd)
         if not await fs.exists(target):
             raise HTTPException(status_code=404, detail=f"Path not found: {p}")
         resolved.append(target)
@@ -1821,7 +1831,7 @@ async def execute(
     _cleanup_expired()
     fs = get_filesystem(http_request)
     session_id = http_request.headers.get("x-session-id")
-    session_cwd = _get_session_cwd(session_id, fs) if session_id else None
+    session_cwd = _get_session_cwd(session_id, fs)
     cwd = fs.resolve_path(request.cwd, cwd=session_cwd) if request.cwd else (session_cwd or fs.home)
 
     runner = await create_runner(request.command, cwd, request.env, run_as_user=fs.username)

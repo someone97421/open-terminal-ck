@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 
 _CACHE_VERSION = 1
@@ -45,6 +45,11 @@ Resolver = Callable[[str], bytes]
 
 class ImageContextError(ValueError):
     """图片来源、内容或预览不能满足模型图片边界。"""
+
+    def __init__(self, message: str, *, code: str = "invalid_image", size_bytes: int | None = None):
+        super().__init__(message)
+        self.code = code
+        self.size_bytes = size_bytes
 
 
 @dataclass(frozen=True)
@@ -201,8 +206,16 @@ class ImageContextGateway:
                         return result
         except ImageContextError:
             raise
+        except UnidentifiedImageError as exc:
+            raise ImageContextError(f"图片格式未知或不受支持（{len(raw)} 字节）", code="unsupported_image", size_bytes=len(raw)) from exc
+        except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+            raise ImageContextError(f"图片解码像素超过安全上限（{len(raw)} 字节）", code="image_too_large", size_bytes=len(raw)) from exc
+        except (OSError, SyntaxError, ValueError) as exc:
+            truncated = any(hint in str(exc).lower() for hint in ("truncated", "unexpected end", "not enough image data", "end of file"))
+            reason = "图片数据被截断或不完整" if truncated else "图片数据损坏或不完整"
+            raise ImageContextError(f"{reason}，无法完整解码（{len(raw)} 字节）", code="incomplete_image" if truncated else "corrupt_image", size_bytes=len(raw)) from exc
         except Exception as exc:
-            raise ImageContextError("图片格式未知、无法解析或不能安全解码") from exc
+            raise ImageContextError(f"图片无法安全解码（{len(raw)} 字节）", size_bytes=len(raw)) from exc
 
     def _encode(self, image: Image.Image) -> ImagePreview:
         working = image.copy()
