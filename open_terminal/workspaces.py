@@ -25,7 +25,7 @@ from open_terminal.dependencies import matches_api_key
 from open_terminal.workspace_context import verify_workspace_context
 
 _PUBLIC = {"/health", "/api/config", "/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
-_HOP = {b"host", b"connection", b"keep-alive", b"transfer-encoding", b"upgrade", b"authorization", b"proxy-authorization", b"x-workspace-context", b"x-workspace-signature"}
+_HOP = {b"host", b"connection", b"keep-alive", b"transfer-encoding", b"upgrade", b"authorization", b"proxy-authorization", b"x-workspace-context", b"x-workspace-signature", b"x-user-id", b"x-session-id"}
 _RUNTIME = ("/usr", "/bin", "/sbin", "/lib", "/lib64")
 _ETC = ("alternatives", "ssl/certs", "ssl/openssl.cnf", "ca-certificates", "fonts", "libreoffice", "ImageMagick-6", "ImageMagick-7", "texmf", "ld.so.cache", "ld.so.conf", "ld.so.conf.d", "nsswitch.conf", "passwd", "group", "hosts", "resolv.conf", "localtime", "timezone")
 _SETTINGS = {
@@ -95,6 +95,11 @@ class WorkspaceManager:
             if path == Path("/") or path in self.root.parents or self.root == path or self.root in path.parents or path.parts[1] in ("home", "root", "tmp", "run", "proc", "dev", "etc", "var"):
                 raise RuntimeError("共享依赖路径不可包含私有目录、工作区或服务状态")
             self.runtime_paths.append(str(path))
+        visible = (*_RUNTIME, *self.runtime_paths)
+        executable = os.path.join(os.path.dirname(sys.executable), "python3") if os.path.basename(sys.executable) == "python3-ot" else sys.executable
+        for path in {executable, os.path.realpath(executable)}:
+            if not any(path.startswith(root.rstrip("/") + "/") for root in visible):
+                raise RuntimeError(f"工作区内不可见 Python 解释器 {path}；请将其所在虚拟环境或前缀加入 OPEN_TERMINAL_WORKSPACE_RUNTIME_PATHS")
 
     def _workspace(self, identity):
         # 主进程只建立根下的哈希目录，不打开工作区内由命令控制的文件。
@@ -126,7 +131,8 @@ class WorkspaceManager:
 
     def _environment(self, workspace, key):
         # 不继承主服务的认证、代理凭据、Python 注入或其他私有环境变量。
-        values = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8", "HOME": workspace, "SHELL": "/bin/bash", "TMPDIR": workspace + "/tmp", "XDG_CACHE_HOME": workspace + "/cache", "OPEN_TERMINAL_API_KEY": key, "OPEN_TERMINAL_WORKSPACE_ISOLATION": "false", "OPEN_TERMINAL_WORKSPACE_DIR": workspace, "OPEN_TERMINAL_MULTI_USER": "false", "OPEN_TERMINAL_ENABLE_BROWSER": "false", "OPEN_TERMINAL_ENABLE_DESKTOP": "false", "OPEN_TERMINAL_LOG_DIR": workspace + "/cache/logs", "OPEN_TERMINAL_FILE_BROWSER_ROOT": "home"}
+        path = ":".join([*(p + "/bin" for p in self.runtime_paths if os.path.isdir(p + "/bin")), "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"])
+        values = {"PATH": path, "LANG": "C.UTF-8", "HOME": workspace, "SHELL": "/bin/bash", "TMPDIR": workspace + "/tmp", "XDG_CACHE_HOME": workspace + "/cache", "OPEN_TERMINAL_API_KEY": key, "OPEN_TERMINAL_WORKSPACE_ISOLATION": "false", "OPEN_TERMINAL_WORKSPACE_DIR": workspace, "OPEN_TERMINAL_MULTI_USER": "false", "OPEN_TERMINAL_ENABLE_BROWSER": "false", "OPEN_TERMINAL_ENABLE_DESKTOP": "false", "OPEN_TERMINAL_LOG_DIR": workspace + "/cache/logs", "OPEN_TERMINAL_FILE_BROWSER_ROOT": "home"}
         from open_terminal import env as settings
         for setting, attribute in _SETTINGS.items():
             value = getattr(settings, attribute)
@@ -281,18 +287,18 @@ class WorkspaceGateway:
                 await JSONResponse({"detail": str(exc)}, status_code=503)(scope, receive, send)
             return
         try:
-            await self._forward(worker, scope, receive, send)
+            await self._forward(worker, identity, scope, receive, send)
         finally:
             self.manager.release(worker)
 
-    async def _forward(self, worker, scope, receive, send):
+    async def _forward(self, worker, identity, scope, receive, send):
         kind = scope["type"]
         forwarded = [(k, v) for k, v in scope["headers"] if k.lower() not in _HOP]
-        forwarded.append((b"authorization", f"Bearer {worker.key}".encode()))
+        forwarded += [(b"authorization", f"Bearer {worker.key}".encode()), (b"x-user-id", identity.user_id.encode("latin-1")), (b"x-session-id", identity.chat_id.encode("latin-1"))]
         raw_path = scope.get("raw_path", scope["path"].encode())
         target = raw_path.decode("ascii") + ("?" + scope["query_string"].decode("ascii") if scope["query_string"] else "")
         if kind == "websocket":
-            await self._websocket(worker, target, forwarded, scope, receive, send)
+            await self._websocket(worker, identity, target, forwarded, scope, receive, send)
             return
 
         async def body():
@@ -340,7 +346,7 @@ class WorkspaceGateway:
             if response:
                 await response.aclose()
 
-    async def _websocket(self, worker, target, headers, scope, receive, send):
+    async def _websocket(self, worker, identity, target, headers, scope, receive, send):
         import json
         from websockets.asyncio.client import unix_connect
         from websockets.exceptions import ConnectionClosed
@@ -370,10 +376,19 @@ class WorkspaceGateway:
                             if not isinstance(payload, dict) or payload.get("type") != "auth" or not matches_api_key(payload.get("token")):
                                 await remote.close(code=4001)
                                 return
-                            payload["token"] = worker.key
+                            payload.update(token=worker.key, user_id=identity.user_id, chat_id=identity.chat_id)
                             await remote.send(json.dumps(payload))
                         else:
-                            await remote.send(message.get("text") if message.get("text") is not None else message.get("bytes", b""))
+                            value = message.get("text") if message.get("text") is not None else message.get("bytes", b"")
+                            if isinstance(value, str):
+                                try:
+                                    payload = json.loads(value)
+                                except (ValueError, TypeError):
+                                    payload = None
+                                if isinstance(payload, dict) and payload.get("type") == "chat":
+                                    payload["chat_id"] = identity.chat_id
+                                    value = json.dumps(payload)
+                            await remote.send(value)
 
                 async def downstream():
                     try:

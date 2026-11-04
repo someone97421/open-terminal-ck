@@ -62,40 +62,53 @@ API Key 通过当前环境传入，也可继续用原有 secret 挂载方式。b
 OPEN_TERMINAL_WORKSPACE_RUNTIME_PATHS=/opt/open-terminal-venv:/opt/shared-tools
 ```
 
-路径以 Linux 的 `:` 分隔，必须是存在的真实绝对目录，不能包含工作区或私有状态。解释器与 Open Terminal 包必须安装在可见运行时中；内部使用 Python `-I` 启动，不依赖当前目录或用户 `PYTHONPATH`。推荐镜像中正常安装的 `/usr/local`，或安装了本项目的 `/opt` 虚拟环境。只挂载完整源码仓库可能暴露其中的私有配置，不应拿它替代干净的共享运行时。
+路径以 Linux 的 `:` 分隔，必须是存在的真实绝对目录，不能包含工作区或私有状态。解释器与 Open Terminal 包必须安装在可见运行时中；网关启动时检查当前解释器（及其符号链接目标）位于 `/usr` 等系统目录或这些路径内，否则直接报错，不会等到首个请求才 503。内部使用 Python `-I` 启动，不依赖当前目录或用户 `PYTHONPATH`。各路径下存在的 `bin/` 按配置顺序置于工作区 `PATH` 前部，终端和命令中的 `python`、`pip` 等优先使用共享虚拟环境；其仍为只读，需要额外包时在工作区内另建虚拟环境（可用 `--system-site-packages` 复用共享包）。推荐镜像中正常安装的 `/usr/local`，或安装了本项目的 `/opt` 虚拟环境。只挂载完整源码仓库可能暴露其中的私有配置，不应拿它替代干净的共享运行时。
 
-## OpenWebUI 的身份接入
+## OpenWebUI 的身份接入（双仓库链路）
 
-本仓库没有 OpenWebUI 数据库，不能独立核实某个 chat 的真实主人。服务端强制验证的是可信后端签发的归属声明，不接受模型工具参数自行选择工作区。
+隔离由两个仓库共同完成：`open-webui-CK` 服务端负责认证用户、持久化对话及其归属并签名；本仓库只验证签名并路由到对应工作进程。本仓库没有 OpenWebUI 数据库，不能独立核实 chat 的真实主人，也不接受模型工具参数或浏览器自行选择工作区。
 
-提供了可直接导入的接入函数：
+链路：
+
+1. 浏览器 → OpenWebUI：普通登录会话，不接触终端 API Key 与签名。
+2. OpenWebUI 服务端：普通聊天在首次上传或访问终端前通过 `/api/v1/chats/new` 持久化，首次发送沿用同一 ID；临时聊天通过 `/api/v1/terminals/chats/prepare` 验证登录用户和实时连接后登记归属，不写入普通聊天库。后续请求重新查验相应的会话归属，再签名。
+3. OpenWebUI → Open Terminal：每次工具调用、上传、原图下载、历史恢复及 WebSocket 建连都重新签名（HMAC 有效期至多 300 秒），附带下列请求头。
+4. Open Terminal 网关：校验 Bearer Key 与签名，按 `SHA256(user_id)/SHA256(chat_id)` 启动或复用工作进程，删除客户端传入的 `X-User-Id`、`X-Session-Id` 后改写为签名内的值再转发。
+
+**自动识别：** 未认证可读的 `GET /api/config` 中 `features.workspace_isolation` 表示是否开启；开启时另含：
+
+```json
+{"workspace_context": {"protocol": "open-terminal/workspace/v1", "version": 1, "algorithm": "HMAC-SHA256", "max_ttl": 300}}
+```
+
+WebUI 的原生 Bearer 终端连接在携带有效聊天身份时统一签名，兼容未开启隔离的终端；该能力声明用于识别隔离状态，无需新增配置开关。隔离网关只接受协议 v1 的有效签名，不会退回共享空间。
+
+**签名格式**（与 `open_terminal/workspace_context.py` 一致）：
+
+- `payload = {"v":1,"user":<user_id>,"chat":<chat_id>,"exp":<unix 秒>}`，JSON 紧凑序列化（`separators=(",",":")`，`ensure_ascii=False`），UTF-8 编码。
+- `X-Workspace-Context = base64url(payload)` 去掉末尾 `=`。
+- `X-Workspace-Signature = hex(HMAC-SHA256(key=现有 API Key, msg="open-terminal/workspace/v1" + "\0" + X-Workspace-Context))`。
+- `exp` 必须晚于当前时间且不超过当前时间 + 300 秒（另容忍 60 秒时钟偏差）；用户与对话标识为非空字符串、各不超过 1024 字节，且须能作为 latin-1 HTTP 头值发送（OpenWebUI 的 UUID 满足）。
+
+请求头：
+
+- `Authorization: Bearer <现有 API Key>`
+- `X-User-Id`、`X-Session-Id`：必须与签名内的 user/chat 完全相同
+- `X-Workspace-Context`、`X-Workspace-Signature`
+
+Python 服务端可直接使用本仓库的同格式实现：
 
 ```python
 from open_terminal.integrations import workspace_headers
 
-# user.id 来自已认证的 OpenWebUI 服务端会话。
-# chat_id 来自当前服务端对话上下文；不要从模型生成的工具参数读取。
-# owns_chat 必须实际查库并返回 bool；新对话应先持久化归属，再签发。
-headers = await workspace_headers(
-    terminal_api_key,
-    user.id,
-    chat_id,
-    owns_chat=owns_chat,
-)
-response = await terminal_client.get(
-    "/files/read",
-    params={"path": "uploads/photo.png"},
-    headers=headers,
-)
+# owns_chat(user_id, chat_id) 可同步或异步，必须实际核验数据库或临时会话登记并严格返回 True。
+headers = await workspace_headers(terminal_api_key, user.id, chat_id, owns_chat=owns_chat)
+response = await terminal_client.get("/files/read", params={"path": "uploads/photo.png"}, headers=headers)
 ```
 
-`owns_chat(user_id, chat_id)` 可为同步或异步函数，必须严格返回 `True` 才签发。签名有效期最长 300 秒，覆盖协议版本、用户、对话和到期时间，使用现有 API Key 及独立域前缀做 HMAC-SHA256。每次工具调用、上传、原图下载、历史恢复都须重新在后端验证并生成这些请求头：
+后端必须覆盖来自客户端的同名请求头。全局 API Key、签名请求头和 WebSocket 首帧中的服务凭据都不能交给浏览器或模型。WebSocket 由可信后端代理，握手请求附相同签名请求头，首帧仍为 `{type: "auth", token: terminal_api_key}`；网关会把 `token` 换成仅在该工作区有效的内部凭据，并用签名身份覆盖首帧的 `user_id`、`chat_id`，客户端填写的值不生效。长连接只在建连时验签，签名过期不影响已建立连接；后续新连接须重新签名。
 
-- `Authorization: Bearer <现有 API Key>`
-- `X-User-Id`、`X-Session-Id`
-- `X-Workspace-Context`、`X-Workspace-Signature`
-
-后端必须覆盖来自客户端的同名请求头。全局 API Key、签名请求头和终端 WebSocket 首帧中的服务凭据都不能交给浏览器或模型。WebSocket 由可信后端代理，连接上附相同签名请求头，沿用 `{type: "auth", token: terminal_api_key, chat_id: ...}` 首帧；网关会替换成仅在该工作区有效的内部凭据。
+**真实部署：** 两个服务共用同一个 API Key（OpenWebUI 中配置的终端连接 Key 即 `OPEN_TERMINAL_API_KEY`），Open Terminal 按上文“部署配置”开启隔离并挂载 `/workspaces` 持久卷，OpenWebUI 的终端连接地址指向该服务。Open Terminal 端口只应对 OpenWebUI 服务端可达，不直接暴露给浏览器；时钟需同步（NTP）。默认安全策略不变：未开启隔离时行为与原来一致，开启后缺少或无效签名一律 401。
 
 **工作区接口的兼容性变化仅在隔离模式生效：** 文件及执行 URL/工具名保留；缺少签名的旧直连方式返回 401，无法退回共享空间。现有 FastMCP 适配器只注入固定 API Key，不会自动获得当前对话身份，需在下游增加每次调用的身份转发，否则调用会被拒绝。`browser`、`desktop` 在隔离模式关闭，避免现有共享会话与额外截图入口绕过边界；其他模式不受此开关影响。`/health`、`/api/config` 和 OpenAPI/文档仍可全局读取，不包含工作区文件。
 

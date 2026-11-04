@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 # 容忍签发端与终端服务之间的时钟偏差。
 _CLOCK_SKEW = 60
+PROTOCOL = "open-terminal/workspace/v1"
 
 
 @dataclass(frozen=True)
@@ -34,7 +35,7 @@ def sign_workspace_context(api_key: str, user_id: str, chat_id: str, *, ttl: int
         raise ValueError("需要现有 API Key，签名有效期为 1 至 300 秒")
     payload = json.dumps({"v": 1, "user": user_id, "chat": chat_id, "exp": int(time.time()) + ttl}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     context = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
-    signature = hmac.new(api_key.encode("utf-8"), b"open-terminal/workspace/v1\0" + context.encode("ascii"), hashlib.sha256).hexdigest()
+    signature = hmac.new(api_key.encode("utf-8"), PROTOCOL.encode() + b"\0" + context.encode("ascii"), hashlib.sha256).hexdigest()
     return {"X-User-Id": user_id, "X-Session-Id": chat_id, "X-Workspace-Context": context, "X-Workspace-Signature": signature}
 
 
@@ -44,7 +45,7 @@ def verify_workspace_context(api_key: str, headers) -> WorkspaceIdentity:
     if not context or len(context) > 8192 or not isinstance(signature, str):
         raise ValueError("缺少有效的工作区签名")
     try:
-        expected = hmac.new(api_key.encode("utf-8"), b"open-terminal/workspace/v1\0" + context.encode("ascii"), hashlib.sha256).hexdigest()
+        expected = hmac.new(api_key.encode("utf-8"), PROTOCOL.encode() + b"\0" + context.encode("ascii"), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(expected, signature):
             raise ValueError("工作区签名无效")
         payload = json.loads(base64.b64decode(context + "=" * (-len(context) % 4), altchars=b"-_", validate=True))

@@ -35,6 +35,7 @@ from open_terminal.dependencies import get_filesystem, matches_api_key, verify_a
 from open_terminal.env import API_KEY, BINARY_FILE_MIME_PREFIXES, CORS_ALLOWED_ORIGINS, ENABLE_BROWSER, ENABLE_DESKTOP, ENABLE_NOTEBOOKS, ENABLE_SYSTEM_PROMPT, ENABLE_TERMINAL, EXECUTE_DESCRIPTION, EXECUTE_TIMEOUT, FILE_BROWSER_ROOT, LOG_DIR, MAX_TERMINAL_SESSIONS, MULTI_USER, OPEN_TERMINAL_INFO, PROCESS_LOG_RETENTION, SESSION_CWD_TTL, SYSTEM_PROMPT, TERMINAL_TERM
 from open_terminal.env import sanitized_environ
 from open_terminal.env import WORKSPACE_ISOLATION, WORKSPACE_DIR, IMAGE_MAX_EDGE, IMAGE_MAX_BYTES, IMAGE_MAX_PIXELS
+from open_terminal.workspace_context import PROTOCOL as WORKSPACE_CONTEXT_PROTOCOL
 from open_terminal.utils.runner import PipeRunner, ProcessRunner, create_runner, read_pty, write_pty, PtyRunner
 from open_terminal.utils.fs import UserFS, FullFileResponse as FileResponse, TemporaryFileResponse, text_file_response, line_range_offsets
 from open_terminal.utils.limits import (CHUNK_SIZE, NormalizeNullQueryMiddleware, run_io, run_worker)
@@ -537,7 +538,9 @@ async def get_config():
             "events": True,
             "browser": ENABLE_BROWSER,
             "desktop": ENABLE_DESKTOP and desktop_available(),
+            "workspace_isolation": WORKSPACE_ISOLATION,
         },
+        **({"workspace_context": {"protocol": WORKSPACE_CONTEXT_PROTOCOL, "version": 1, "algorithm": "HMAC-SHA256", "max_ttl": 300}} if WORKSPACE_ISOLATION else {}),
     }
 
 

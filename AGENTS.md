@@ -39,7 +39,7 @@
 | 同步追踪记录 | `docs/UPSTREAM_SYNC.md` | 增量同步与暂缓项依据 | 与上游同名文件冲突时以本地记录为准 |
 | 精简流水线 | `.github/workflows/ci.yml` | 仅保留代码检查与镜像构建验证 | 上游新增或改动 workflows 时不引入发布、签名、部署步骤 |
 | 分发方式 | `README.md`、`pyproject.toml` | 不发布镜像与包 | 上游 README 更新时保留本地构建说明，不恢复镜像仓库与包管理平台引用 |
-| 对话工作区隔离 | `open_terminal/workspaces.py`、`workspace_worker.py`、`workspace_context.py`、`dependencies.py`、`utils/fs.py` | 用户＋对话文件持久隔离、依赖共用 | 保留签名身份、整工作进程沙箱、持久目录及相关镜像配置，不能退回仅 cwd 隔离 |
+| 对话工作区隔离 | `open_terminal/workspaces.py`、`workspace_worker.py`、`workspace_context.py`、`dependencies.py`、`utils/fs.py`、`main.py` | 用户＋对话文件持久隔离、依赖共用 | 与 WebUI 的上传前会话准备和按次签名共同保留；保留能力声明、HTTP/WS 身份绑定、整工作进程沙箱及只读共享依赖，不退回仅 cwd 隔离 |
 | 模型图片网关 | `open_terminal/utils/image_context.py`、`integrations.py`、`main.py`、`utils/notebooks.py`、`docs/WORKSPACE_IMAGE_CONTEXT.md` | 大图受限预览、原图保留与 OpenWebUI 接入 | 保留所有读图及最终发送校验，不恢复模型直接读取原图的路径 |
 
 ## 6. 上游同步固定流程
