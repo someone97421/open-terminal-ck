@@ -103,15 +103,15 @@ class WorkspaceManager:
 
     def _workspace(self, identity):
         # 主进程只建立根下的哈希目录，不打开工作区内由命令控制的文件。
-        user_hash, chat_hash = identity.directory_parts
+        user_hash, scope_hash = identity.directory_parts
         user_dir = self.root / user_hash
         user_dir.mkdir(mode=0o700, exist_ok=True)
         if user_dir.is_symlink() or user_dir.resolve() != user_dir:
             raise RuntimeError("用户工作目录无效")
-        workspace = user_dir / chat_hash
+        workspace = user_dir / scope_hash
         workspace.mkdir(mode=0o700, exist_ok=True)
         if workspace.is_symlink() or workspace.resolve() != workspace:
-            raise RuntimeError("对话工作目录无效")
+            raise RuntimeError("工作区目录无效")
         return str(workspace)
 
     def _command(self, workspace, runtime):
@@ -169,12 +169,13 @@ class WorkspaceManager:
         return False
 
     async def get(self, identity):
-        worker = self.workers.get(identity)
+        workspace_key = identity.workspace_key
+        worker = self.workers.get(workspace_key)
         if worker and not worker.draining and worker.process.returncode is None:
             worker.active += 1
             return worker
         async with self.lock:
-            worker = self.workers.get(identity)
+            worker = self.workers.get(workspace_key)
             if worker and not worker.draining and worker.process.returncode is None:
                 worker.active += 1
                 return worker
@@ -182,24 +183,24 @@ class WorkspaceManager:
                 if expired.process.returncode is not None:
                     await expired.close()
                     del self.workers[key]
-            task = self.starting.get(identity)
+            task = self.starting.get(workspace_key)
             if task is None:
                 if len(set(self.workers) | set(self.starting)) >= WORKSPACE_MAX_WORKERS and not await self._evict_idle():
                     raise RuntimeError("所有工作区均在使用，暂时无法分配新工作区；文件会保留")
                 task = asyncio.create_task(self._start(identity))
-                self.starting[identity] = task
-                task.add_done_callback(lambda done: self._finished_start(identity, done))
-            self.waiters[identity] = self.waiters.get(identity, 0) + 1
+                self.starting[workspace_key] = task
+                task.add_done_callback(lambda done: self._finished_start(workspace_key, done))
+            self.waiters[workspace_key] = self.waiters.get(workspace_key, 0) + 1
         try:
             worker = await asyncio.shield(task)
             worker.active += 1
             return worker
         finally:
-            self.waiters[identity] -= 1
-            if not self.waiters[identity]:
-                del self.waiters[identity]
-                if task.done() and self.starting.get(identity) is task:
-                    del self.starting[identity]
+            self.waiters[workspace_key] -= 1
+            if not self.waiters[workspace_key]:
+                del self.waiters[workspace_key]
+                if task.done() and self.starting.get(workspace_key) is task:
+                    del self.starting[workspace_key]
 
     async def _start(self, identity):
         workspace = self._workspace(identity)
@@ -225,7 +226,7 @@ class WorkspaceManager:
                 try:
                     response = await client.get("/health", timeout=0.25)
                     if response.status_code == 200:
-                        self.workers[identity] = worker
+                        self.workers[identity.workspace_key] = worker
                         return worker
                 except httpx.TransportError:
                     pass

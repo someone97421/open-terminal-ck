@@ -2,7 +2,7 @@
 
 ## 实现与适用范围
 
-本改造新增可选的 `OPEN_TERMINAL_WORKSPACE_ISOLATION=true`。它使用同一镜像中的 Linux bubblewrap，为每个 `(user_id, chat_id)` 启动一个常驻 API 工作进程，不为对话创建容器或重复安装 Python、Node、FFmpeg 等依赖。
+本改造新增可选的 `OPEN_TERMINAL_WORKSPACE_ISOLATION=true`。它使用同一镜像中的 Linux bubblewrap，为每个独立聊天 `(user_id, chat_id)` 或项目 `(owner_id, project_id)` 启动一个常驻 API 工作进程，不为对话创建容器或重复安装 Python、Node、FFmpeg 等依赖。
 
 主网关验证现有 Bearer API Key 和工作区签名，然后将 HTTP、上传下载、流式输出、终端 WebSocket、notebook 与端口代理转发给对应工作进程。文件处理与任意命令都处于同一个受限文件系统视图，其他工作区没有挂载进去；服务端直接文件读写也在这个视图内，避免只检查路径后仍从宿主打开文件的竞态。
 
@@ -19,6 +19,8 @@
 ```
 
 原始标识不作为目录名，使用完整哈希。已有上传、写入和执行接口仍可以选择工作区内部的任意子目录；这些子目录是默认整理结构，不强制重命名用户文件。`/files/cwd` 设置的目录持久化到各自的 `cache/cwd.json`，无效或已删除时退回工作区根。普通 shell 的 `cd` 仍只影响该 shell；跨工具修改默认目录使用现有的 cwd 接口。
+
+项目使用 `/workspaces/<SHA256(owner_id)>/project-<SHA256(project_id)>/`，共享该项目的聊天和成员复用同一工作进程。共享的 `AGENTS.md` 位于项目根目录；`X-Session-Id` 仍为真实聊天 ID，shell/notebook 会话仍按用户与聊天区分。项目归档只限制 WebUI 的新请求，不删除目录；服务端不自行清理项目文件。v1 聊天目录完全兼容，不自动迁移旧数据。
 
 `/usr`、`/bin`、`/sbin`、`/lib`、`/lib64` 只读共享，`/etc` 仅挂载证书、动态链接、字体、账号名称和名称解析等必要项；不挂载宿主 `/home`、`/root`、Docker socket、sudoers 或主服务状态目录。每个工作区使用独立的 PID、IPC、挂载及默认网络命名空间。`TMPDIR` 指向工作区的 `tmp/`，缓存及日志也保存在自己的工作区；硬编码 `/tmp` 的程序使用独立的临时视图，该部分不跨进程重启保留。工作进程通信 socket 位于临时运行目录。
 
@@ -73,21 +75,23 @@ OPEN_TERMINAL_WORKSPACE_RUNTIME_PATHS=/opt/open-terminal-venv:/opt/shared-tools
 1. 浏览器 → OpenWebUI：普通登录会话，不接触终端 API Key 与签名。
 2. OpenWebUI 服务端：普通聊天在首次上传或访问终端前通过 `/api/v1/chats/new` 持久化，首次发送沿用同一 ID；临时聊天通过 `/api/v1/terminals/chats/prepare` 验证登录用户和实时连接后登记归属，不写入普通聊天库。后续请求重新查验相应的会话归属，再签名。
 3. OpenWebUI → Open Terminal：每次工具调用、上传、原图下载、历史恢复及 WebSocket 建连都重新签名（HMAC 有效期至多 300 秒），附带下列请求头。
-4. Open Terminal 网关：校验 Bearer Key 与签名，按 `SHA256(user_id)/SHA256(chat_id)` 启动或复用工作进程，删除客户端传入的 `X-User-Id`、`X-Session-Id` 后改写为签名内的值再转发。
+4. Open Terminal 网关：校验 Bearer Key 与签名，v1 按 `SHA256(user_id)/SHA256(chat_id)`、v2 按 `SHA256(owner_id)/project-SHA256(project_id)` 启动或复用工作进程，删除客户端传入的 `X-User-Id`、`X-Session-Id` 后改写为签名内的值再转发。WebUI 的新普通 Chat 使用独立 Pyodide，项目 Chat 使用此 v2 Terminal 链路。
 
 **自动识别：** 未认证可读的 `GET /api/config` 中 `features.workspace_isolation` 表示是否开启；开启时另含：
 
 ```json
-{"workspace_context": {"protocol": "open-terminal/workspace/v1", "version": 1, "algorithm": "HMAC-SHA256", "max_ttl": 300}}
+{"features":{"workspace_isolation":true,"project_workspaces":true},"workspace_context":{"protocol":"open-terminal/workspace/v1","protocols":["open-terminal/workspace/v1","open-terminal/workspace/v2"],"scopes":["chat","project"],"version":1,"algorithm":"HMAC-SHA256","max_ttl":300}}
 ```
 
-WebUI 的原生 Bearer 终端连接在携带有效聊天身份时统一签名，兼容未开启隔离的终端；该能力声明用于识别隔离状态，无需新增配置开关。隔离网关只接受协议 v1 的有效签名，不会退回共享空间。
+WebUI 的原生 Bearer 终端连接在携带有效聊天身份时统一签名，兼容未开启隔离的终端；项目要求隔离已开启且声明 v2/project 能力。隔离网关接受 v1 与 v2 的有效签名，不会退回共享空间。
 
 **签名格式**（与 `open_terminal/workspace_context.py` 一致）：
 
 - `payload = {"v":1,"user":<user_id>,"chat":<chat_id>,"exp":<unix 秒>}`，JSON 紧凑序列化（`separators=(",",":")`，`ensure_ascii=False`），UTF-8 编码。
 - `X-Workspace-Context = base64url(payload)` 去掉末尾 `=`。
 - `X-Workspace-Signature = hex(HMAC-SHA256(key=现有 API Key, msg="open-terminal/workspace/v1" + "\0" + X-Workspace-Context))`。
+- 项目 v2 的 payload 为 `{"v":2,"user":<当前用户>,"chat":<真实聊天>,"scope_type":"project","scope_id":<项目ID>,"owner":<项目所有者>,"exp":<unix秒>}`；签名前缀改为 `open-terminal/workspace/v2`，编码及请求头校验相同。可信接入端必须查验项目和聊天真实归属，不能接受客户端指定 owner/scope。`sign_workspace_context` 支持相应关键字参数；原有 `integrations.workspace_headers` 仍用于 v1 聊天。
+- 项目设置使用可信 WebUI 内部的 `project:<id>` session 读写根目录 `AGENTS.md`；此上下文不由浏览器直接签发，不占用真实聊天的实时会话。
 - `exp` 必须晚于当前时间且不超过当前时间 + 300 秒（另容忍 60 秒时钟偏差）；用户与对话标识为非空字符串、各不超过 1024 字节，且须能作为 latin-1 HTTP 头值发送（OpenWebUI 的 UUID 满足）。
 
 请求头：
