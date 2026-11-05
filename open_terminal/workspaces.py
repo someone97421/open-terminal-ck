@@ -29,7 +29,7 @@ from open_terminal.workspace_context import verify_workspace_context
 log = logging.getLogger(__name__)
 
 _PUBLIC = {"/health", "/api/config", "/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
-_HOP = {b"host", b"connection", b"keep-alive", b"transfer-encoding", b"upgrade", b"authorization", b"proxy-authorization", b"x-workspace-context", b"x-workspace-signature", b"x-user-id", b"x-session-id"}
+_HOP = {b"host", b"connection", b"keep-alive", b"transfer-encoding", b"upgrade", b"authorization", b"proxy-authorization", b"x-workspace-context", b"x-workspace-signature", b"x-user-id", b"x-session-id", b"x-skill-scope", b"x-skill-scope-id"}
 _RUNTIME = ("/usr", "/bin", "/sbin", "/lib", "/lib64")
 _ETC = ("alternatives", "ssl/certs", "ssl/openssl.cnf", "ca-certificates", "fonts", "libreoffice", "ImageMagick-6", "ImageMagick-7", "texmf", "ld.so.cache", "ld.so.conf", "ld.so.conf.d", "nsswitch.conf", "passwd", "group", "hosts", "resolv.conf", "localtime", "timezone")
 _SETTINGS = {
@@ -524,6 +524,7 @@ class WorkspaceGateway:
         kind = scope["type"]
         forwarded = [(k, v) for k, v in scope["headers"] if k.lower() not in _HOP]
         forwarded += [(b"authorization", f"Bearer {worker.key}".encode()), (b"x-user-id", identity.user_id.encode("latin-1")), (b"x-session-id", identity.chat_id.encode("latin-1"))]
+        forwarded += [(b"x-skill-scope", identity.scope_type.encode("ascii")), (b"x-skill-scope-id", (identity.scope_id or identity.chat_id).encode("latin-1"))]
         raw_path = scope.get("raw_path", scope["path"].encode())
         target = raw_path.decode("ascii") + ("?" + scope["query_string"].decode("ascii") if scope["query_string"] else "")
         if kind == "websocket":

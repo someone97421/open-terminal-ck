@@ -44,7 +44,8 @@ from open_terminal.utils.git import GitRepository
 from open_terminal.utils.events import system_events
 from open_terminal.utils.search import search_entries, matching_files, ranked_page
 from open_terminal.utils.image_context import ImageContextGateway, ImageContextError, _OPEN_FORMATS
-from open_terminal.utils.skills import join_skill_path, list_skill_resources, parse_skill_frontmatter
+from open_terminal.utils.skills import parse_skill_frontmatter
+from open_terminal.skill_packages import router as skill_packages_router, summaries as skill_package_summaries, detail as skill_package_detail
 
 image_gateway = ImageContextGateway(max_edge=IMAGE_MAX_EDGE, max_bytes=IMAGE_MAX_BYTES, max_pixels=IMAGE_MAX_PIXELS)
 
@@ -366,15 +367,22 @@ class ReplaceRequest(BaseModel):
 class SkillSummary(BaseModel):
     id: str
     name: str
-    description: str
+    description: str | None = None
     location: str
     scope: str
     source: str = "terminal"
+    package_id: str | None = None
+    scope_id: str = ""
+    meta: dict = Field(default_factory=dict)
+    is_active: bool = True
+    write_access: bool = False
 
 
 class SkillReadResponse(SkillSummary):
     content: str
     resources: list[str]
+    files: list[dict] = Field(default_factory=list)
+    version_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -580,41 +588,6 @@ if OPEN_TERMINAL_INFO:
         return {"info": OPEN_TERMINAL_INFO}
 
 
-GLOBAL_SKILL_DIRS = (".agents/skills", ".cptr/skills", ".claude/skills", ".codex/skills")
-
-
-async def _list_skills_in_dir(fs: UserFS, root: str, scope: str) -> list[SkillSummary]:
-    if not await fs.isdir(root):
-        return []
-
-    skills: list[SkillSummary] = []
-    for entry in await fs.listdir(root):
-        dirname = str(entry.get("name") or "")
-        if entry.get("type") != "directory" or not dirname or dirname.startswith("."):
-            continue
-        skill_dir = join_skill_path(root, dirname)
-        skill_path = join_skill_path(skill_dir, "SKILL.md")
-        if not await fs.isfile(skill_path):
-            continue
-        frontmatter, _ = parse_skill_frontmatter(await fs.read_text(skill_path))
-        description = (frontmatter.get("description") or "").strip()
-        if not description:
-            continue
-        name = (frontmatter.get("name") or dirname).strip()
-        if not name:
-            continue
-        skills.append(
-            SkillSummary(
-                id=f"terminal:{url_quote(name, safe='')}",
-                name=name,
-                description=description[:1024],
-                location=skill_path,
-                scope=scope,
-            )
-        )
-    return skills
-
-
 # ---------------------------------------------------------------------------
 # Files
 # ---------------------------------------------------------------------------
@@ -668,23 +641,8 @@ async def list_skills(
     http_request: Request,
     fs: UserFS = Depends(get_filesystem),
 ):
-    roots = [("global", join_skill_path(fs.home, path)) for path in GLOBAL_SKILL_DIRS]
-    seen_names: set[str] = set()
-    seen_roots: set[str] = set()
-    skills: list[SkillSummary] = []
-
-    for scope, root in roots:
-        root = os.path.normpath(root)
-        if root in seen_roots:
-            continue
-        seen_roots.add(root)
-        for skill in await _list_skills_in_dir(fs, root, scope):
-            if skill.name in seen_names:
-                continue
-            seen_names.add(skill.name)
-            skills.append(skill)
-
-    return skills
+    result = await skill_package_summaries(http_request, fs)
+    return [SkillSummary(**{**item, "id": f"terminal:{url_quote(item['name'], safe='')}"}) for item in result["items"]]
 
 
 @app.get(
@@ -701,16 +659,12 @@ async def read_skill(
     for skill in await list_skills(http_request, fs):
         if skill.name != name:
             continue
-
-        text = await fs.read_text(skill.location)
-        _frontmatter, body = parse_skill_frontmatter(text)
-        resources = await list_skill_resources(fs, os.path.dirname(skill.location))
+        package = await skill_package_detail(http_request, fs, skill.package_id)
+        _frontmatter, body = parse_skill_frontmatter(package["content"])
         return SkillReadResponse(
-            **skill.model_dump(),
-            resources=resources,
-            content=body,
+            **skill.model_dump(), content=body, resources=package["resources"],
+            files=package["files"], version_id=package["version_id"],
         )
-
     raise HTTPException(status_code=404, detail="Skill not found")
 
 
@@ -2575,3 +2529,5 @@ if WORKSPACE_DIR:
             busy = busy or bool(notebooks._sessions)
         busy = busy or any(name.isdigit() and int(name) not in (1, os.getpid()) for name in os.listdir("/proc"))
         return {"idle": not busy}
+
+app.include_router(skill_packages_router)
