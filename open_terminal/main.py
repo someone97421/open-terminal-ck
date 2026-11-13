@@ -41,8 +41,10 @@ from open_terminal.utils.fs import UserFS, FullFileResponse as FileResponse, Tem
 from open_terminal.utils.limits import (CHUNK_SIZE, NormalizeNullQueryMiddleware, run_io, run_worker)
 from open_terminal.utils.file_compare import CompareRequest, run_comparison
 from open_terminal.utils.git import GitRepository
+from open_terminal.utils.system import collect_system_info, foreground_process
 from open_terminal.utils.events import system_events
 from open_terminal.utils.search import search_entries, matching_files, ranked_page
+from open_terminal.utils.setup import start_directory
 from open_terminal.utils.image_context import ImageContextGateway, ImageContextError, _OPEN_FORMATS
 from open_terminal.utils.skills import parse_skill_frontmatter
 from open_terminal.skill_packages import router as skill_packages_router, summaries as skill_package_summaries, detail as skill_package_detail
@@ -442,17 +444,17 @@ def _expire_session_cwds():
 
 
 def _get_session_cwd(session_id: str | None, fs: "UserFS") -> str:
-    """Return the tracked cwd for *session_id*, or ``fs.home`` as default."""
+    """Return the tracked cwd for *session_id*, or the start directory as default."""
     _expire_session_cwds()
     key = (fs.home, session_id)
     if session_id and key in _session_cwds:
         cwd, _ = _session_cwds[key]
         if not fs.is_path_allowed(cwd) or not os.path.isdir(cwd):
             del _session_cwds[key]
-            return fs.load_cwd()
+            return fs.load_cwd() if fs.workspace_root else start_directory(fs.home)
         _session_cwds[key] = (cwd, time.time())  # refresh TTL
         return cwd
-    return fs.load_cwd() if fs.workspace_root else fs.home
+    return fs.load_cwd() if fs.workspace_root else start_directory(fs.home)
 
 
 def _set_session_cwd(session_id: str | None, path: str, fs: "UserFS"):
@@ -499,7 +501,8 @@ async def _maintenance_loop():
         _expire_session_cwds()
         if ENABLE_TERMINAL:
             for sid, session in list(_terminal_sessions.items()):
-                if not _session_is_alive(session):
+                if (not _session_is_alive(session) or
+                    (not session["connected"] and time.monotonic() - session.get("detached_at", time.monotonic()) > 300)):
                     await _cleanup_session(sid)
         active = {p.log_path for p in _processes.values() if p.finished_at is None}
         try:
@@ -561,6 +564,14 @@ async def get_config():
         },
         **({"workspace_context": {"protocol": WORKSPACE_CONTEXT_PROTOCOL, "version": 1, "protocols": [WORKSPACE_CONTEXT_PROTOCOL, PROJECT_PROTOCOL], "scopes": ["chat", "project"], "operations": ["delete"], "algorithm": "HMAC-SHA256", "max_ttl": 300}} if WORKSPACE_ISOLATION else {}),
     }
+
+
+@app.get("/system/info", dependencies=[Depends(verify_api_key)], include_in_schema=False)
+async def system_info(http_request: Request, fs: UserFS = Depends(get_filesystem)):
+    directory = _get_session_cwd(http_request.headers.get("x-session-id"), fs) or fs.home
+    fs._check_path(os.path.realpath(directory))
+    info = await run_io(collect_system_info, directory, fs.username)
+    return JSONResponse(info, headers={"Cache-Control": "no-store"})
 
 
 if ENABLE_SYSTEM_PROMPT:
@@ -773,9 +784,9 @@ async def git_worktrees(http_request: Request, root: str = ".", fs: UserFS = Dep
 
 @app.get("/git/pr/{view}", dependencies=[Depends(verify_api_key)], include_in_schema=False)
 async def git_pull_requests(http_request: Request, view: str, root: str = ".", number: int = 0,
-                            state: str = "open", fs: UserFS = Depends(get_filesystem)):
+                            state: str = "open", search: str = "", fs: UserFS = Depends(get_filesystem)):
     cwd = _get_session_cwd(http_request.headers.get("x-session-id"), fs)
-    return await GitRepository(fs, root, cwd).pull_requests(view, number, state)
+    return await GitRepository(fs, root, cwd).pull_requests(view, number, state, search)
 
 
 class PullRequestAction(BaseModel):
@@ -799,6 +810,27 @@ async def git_pull_request_action(http_request: Request, action: str, payload: P
             raise HTTPException(400, "Invalid review event")
         action = {"approve": "approve", "comment": "review-comment", "request_changes": "request-changes"}[payload.event]
     return await GitRepository(fs, payload.root, cwd).pull_request_action(action, method=payload.strategy, **fields)
+
+
+@app.get("/git/issue/{view}", dependencies=[Depends(verify_api_key)], include_in_schema=False)
+async def git_issues(http_request: Request, view: str, root: str = ".", number: int = 0,
+                     state: str = "open", search: str = "", fs: UserFS = Depends(get_filesystem)):
+    cwd = _get_session_cwd(http_request.headers.get("x-session-id"), fs)
+    return await GitRepository(fs, root, cwd).issues(view, number, state, search)
+
+
+class IssueAction(BaseModel):
+    root: str = "."
+    number: int = 0
+    title: str = ""
+    body: str = ""
+    reason: str = "completed"
+
+
+@app.post("/git/issue/{action}", dependencies=[Depends(verify_api_key)], include_in_schema=False)
+async def git_issue_action(http_request: Request, action: str, payload: IssueAction, fs: UserFS = Depends(get_filesystem)):
+    cwd = _get_session_cwd(http_request.headers.get("x-session-id"), fs)
+    return await GitRepository(fs, payload.root, cwd).issue_action(action, **payload.model_dump(exclude={"root"}))
 
 
 class GitActionRequest(BaseModel):
@@ -989,7 +1021,9 @@ async def view_file(
 )
 async def serve_file(http_request: Request, path: str, fs: UserFS = Depends(get_filesystem)):
     """Path-based alias for view_file — enables relative URL resolution in iframes."""
-    return await view_file(http_request, path=f"/{path}", preview=False, fs=fs)
+    if not path.startswith("/") and not os.path.isabs(path):
+        path = f"/{path}"
+    return await view_file(http_request, path=path, preview=False, fs=fs)
 
 
 @app.post(
@@ -1544,11 +1578,25 @@ async def upload_file(
     try:
         fs._check_path(path)
         await fs.mkdir(directory)
-        async with aiofiles.open(path, "wb") as output:
-            while chunk := await file.read(CHUNK_SIZE):
-                size += len(chunk)
-                await output.write(chunk)
-        await fs._chown(path)
+        try:
+            previous_mode = os.stat(path).st_mode & 0o777
+        except FileNotFoundError:
+            previous_mode = None
+        temporary = os.path.join(directory, f".open-terminal-upload-{uuid.uuid4().hex}")
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        os.close(fd)
+        try:
+            async with aiofiles.open(temporary, "wb") as output:
+                while chunk := await file.read(CHUNK_SIZE):
+                    size += len(chunk)
+                    await output.write(chunk)
+            if previous_mode is not None:
+                await asyncio.to_thread(os.chmod, temporary, previous_mode)
+            await fs._chown(temporary)
+            await asyncio.to_thread(os.replace, temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
     except PermissionError as exc:
         raise HTTPException(403, str(exc))
     except OSError as exc:
@@ -1788,7 +1836,16 @@ async def execute(
     session_cwd = _get_session_cwd(session_id, fs)
     cwd = fs.resolve_path(request.cwd, cwd=session_cwd) if request.cwd else (session_cwd or fs.home)
 
-    runner = await create_runner(request.command, cwd, request.env, run_as_user=fs.username)
+    env = request.env
+    if ENABLE_DESKTOP:
+        from open_terminal.desktop import Desktop, desktops, desktop_key
+
+        desktop = desktops.get(desktop_key(http_request, fs))
+        if isinstance(desktop, Desktop):
+            # Lets windows opened by commands appear on the user's running desktop.
+            env = {"DISPLAY": desktop.env["DISPLAY"], "XAUTHORITY": desktop.env["XAUTHORITY"], **(request.env or {})}
+
+    runner = await create_runner(request.command, cwd, env, run_as_user=fs.username)
 
     process_id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
     log_path = os.path.join(LOG_DIR, "processes", f"{process_id}.jsonl")
@@ -2094,7 +2151,8 @@ if ENABLE_TERMINAL:
         if session is None:
             return
 
-        tasks = session.get("io_tasks", ())
+        tasks = [task for task in (*session.get("io_tasks", ()), *session.get("viewer_tasks", ()))
+                 if task is not asyncio.current_task()]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -2171,7 +2229,7 @@ if ENABLE_TERMINAL:
 
                 # Use per-session cwd if available, else fall back to home
                 chat_id = request.headers.get("x-session-id")
-                session_cwd = _get_session_cwd(chat_id, fs) if chat_id else None
+                session_cwd = _get_session_cwd(chat_id, fs)
 
                 if fs.username:
                     shell_cmd = [
@@ -2179,10 +2237,10 @@ if ENABLE_TERMINAL:
                         f"sudo -i -u {fs.username}",
                         "/dev/null",
                     ]
-                    cwd = session_cwd or fs.home
+                    cwd = session_cwd or start_directory(fs.home)
                 else:
                     shell_cmd = [os.environ.get("SHELL", "/bin/sh")]
-                    cwd = session_cwd or os.getcwd()
+                    cwd = session_cwd or start_directory(fs.home)
 
                 spawn_env = sanitized_environ()
                 spawn_env.setdefault("TERM", TERMINAL_TERM)
@@ -2194,6 +2252,8 @@ if ENABLE_TERMINAL:
                     cwd=cwd,
                     env=spawn_env,
                     start_new_session=True,
+                    # after setsid, so the pty becomes the controlling terminal
+                    preexec_fn=lambda: fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0),
                 )
             except Exception:
                 os.close(slave_fd)
@@ -2214,12 +2274,13 @@ if ENABLE_TERMINAL:
             }
 
         else:  # winpty
+            fs = get_filesystem(request)
             shell = os.environ.get("COMSPEC", "cmd.exe")
             spawn_env = sanitized_environ()
             spawn_env.setdefault("TERM", TERMINAL_TERM)
             pty_proc = _WinPtyProcess.spawn(
                 [shell],
-                cwd=os.getcwd(),
+                cwd=_get_session_cwd(request.headers.get("x-session-id"), fs),
                 env=spawn_env,
                 dimensions=(24, 80),
             )
@@ -2237,12 +2298,48 @@ if ENABLE_TERMINAL:
             output=bytearray(),
             connected=False,
             input_lock=asyncio.Lock(),
+            output_offset=0,
+            output_changed=asyncio.Event(),
+            output_consumed=asyncio.Event(),
+            reader_done=False,
+            detached_at=time.monotonic(),
         )
+        session["io_tasks"] = (asyncio.create_task(_read_terminal_output(session)),)
         return {
             "id": session_id,
             "created_at": session["created_at"],
             "pid": session["pid"],
         }
+
+
+    async def _read_terminal_output(session: dict):
+        """Drain the PTY even while no viewer is attached."""
+        try:
+            while True:
+                # Stop the producer before unread output can leave the retained history.
+                while (session.get("viewer_ack") is not None
+                       and session["output_offset"] - session["viewer_ack"] >= 512 * 1024):
+                    session["output_consumed"].clear()
+                    await session["output_consumed"].wait()
+                if session["backend"] == "pty":
+                    data = await read_pty(session["master_fd"])
+                else:
+                    try:
+                        value = await asyncio.to_thread(session["pty_process"].read, 4096)
+                        data = value.encode(errors="replace") if value else b""
+                    except EOFError:
+                        break
+                if not data:
+                    break
+                session["output"].extend(data)
+                session["output_offset"] += len(data)
+                del session["output"][:-1024 * 1024]
+                session["output_changed"].set()
+        except (OSError, EOFError):
+            pass
+        finally:
+            session["reader_done"] = True
+            session["output_changed"].set()
 
 
     def _session_is_alive(session: dict) -> bool:
@@ -2269,7 +2366,7 @@ if ENABLE_TERMINAL:
     def _user_terminal(request: Request) -> dict:
         sessions = [
             session for session in reversed(_terminal_sessions.values())
-            if _owns_terminal(session, request) and session["connected"] and _session_is_alive(session)
+            if _owns_terminal(session, request) and _session_is_alive(session)
         ]
         if sessions:
             return max(sessions, key=lambda session: (session.get("active", False), session.get("last_active", 0)))
@@ -2380,6 +2477,15 @@ if ENABLE_TERMINAL:
 
         The server replies with the same type and chat_id, or an error. A shell
         already assigned to a different chat cannot be reassigned.
+
+        With ``resume`` and ``flow_control`` set to true in auth, the server
+        confirms ``{"type": "flow_control"}``. Acknowledge consumed output with
+        ``{"type": "ack", "cursor": <output end>}`` to release more data.
+        Reads pause when the attached viewer falls behind; detached shells keep
+        running with bounded history.
+
+        Set ``process_info`` to true in auth to receive foreground process
+        changes as ``{"type": "process", "pid": ..., "name": ...}`` on Unix.
         """
         session = _terminal_sessions.get(session_id)
         if session is None:
@@ -2406,15 +2512,12 @@ if ENABLE_TERMINAL:
             await ws.close(code=4009, reason="Session already connected")
             return
         session["connected"] = True
-        loop = asyncio.get_event_loop()
         stop_event = asyncio.Event()
 
         # --- Platform-specific read/write/resize helpers ---
 
         if backend == "pty":
             master_fd = session["master_fd"]
-            process = session["process"]
-
             def _do_resize(rows: int, cols: int):
                 fcntl.ioctl(
                     master_fd,
@@ -2425,42 +2528,110 @@ if ENABLE_TERMINAL:
         else:  # winpty
             pty_proc = session["pty_process"]
 
-            def _blocking_read():
-                """Read from WinPTY process."""
-                try:
-                    data = pty_proc.read(4096)
-                    return data.encode(errors="replace") if data else b""
-                except EOFError:
-                    return b""
-                except Exception:
-                    return b""
-
             def _do_resize(rows: int, cols: int):
                 pty_proc.setwinsize(rows, cols)
 
         # --- Reader / writer tasks ---
 
+        resume = payload.get("resume") is True
+        cursor = payload.get("cursor", 0) if resume else 0
+        if not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 0 or cursor > session["output_offset"]:
+            session["connected"] = False
+            await ws.close(code=4000, reason="Invalid output cursor")
+            return
+
+        flow_control = resume and payload.get("flow_control") is True
+        acknowledged = max(cursor, session["output_offset"] - len(session["output"]))
+        if flow_control:
+            session["viewer_ack"] = acknowledged
+
         async def _pty_reader():
-            """Forward PTY output -> WebSocket."""
+            nonlocal cursor
+            # shortcut: winpty needs separate console foreground detection for Windows.
+            process_info = payload.get("process_info") is True and backend == "pty"
+            # Reset stale titles from retained output before following the live process.
+            replay_end = session["output_offset"]
+            last_process = None
+            last_group = None
+            sampled_at = 0.0
+            if flow_control:
+                await ws.send_json({"type": "flow_control"})
             while not stop_event.is_set():
-                data = await read_pty(master_fd) if backend == "pty" else await loop.run_in_executor(None, _blocking_read)
-                if not data:
-                    break
-                session["output"].extend(data)
-                del session["output"][:-65536]
-                await ws.send_bytes(data)
+                while flow_control and cursor - acknowledged >= 256 * 1024:
+                    session["output_consumed"].clear()
+                    await session["output_consumed"].wait()
+                session["output_changed"].clear()
+                if process_info and cursor >= replay_end:
+                    try:
+                        group = os.tcgetpgrp(master_fd)
+                    except OSError:
+                        group = None
+                    now = time.monotonic()
+                    if group != last_group or now - sampled_at >= 0.5:
+                        current = await asyncio.to_thread(foreground_process, master_fd)
+                        last_group, sampled_at = group, now
+                        if current is not None and current != last_process:
+                            await ws.send_json({"type": "process", **current})
+                            last_process = current
+                oldest = session["output_offset"] - len(session["output"])
+                start = max(cursor, oldest)
+                end = min(session["output_offset"], start + 64 * 1024)
+                if flow_control:
+                    end = min(end, acknowledged + 256 * 1024)
+                if end > cursor:
+                    data = bytes(session["output"][start - oldest:end - oldest])
+                    truncated = cursor < oldest
+                    cursor = end
+                    if resume:
+                        await ws.send_json({"type": "output", "start": start, "end": end, "truncated": truncated})
+                    await ws.send_bytes(data)
+                    continue
+                if session["reader_done"]:
+                    return
+                if process_info:
+                    try:
+                        await asyncio.wait_for(session["output_changed"].wait(), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        pass
+                else:
+                    await session["output_changed"].wait()
+
+        input_queue = asyncio.Queue(maxsize=64)
+        input_bytes = 0
+
+        async def _input_writer():
+            nonlocal input_bytes
+            while True:
+                data = await input_queue.get()
+                await _write_terminal(session, data)
+                input_bytes -= len(data)
 
         async def _ws_reader():
+            nonlocal acknowledged, input_bytes
             while True:
                 msg = await ws.receive()
                 if msg["type"] == "websocket.disconnect":
                     break
                 elif "bytes" in msg and msg["bytes"]:
-                    await _write_terminal(session, msg["bytes"])
+                    data = msg["bytes"]
+                    if input_queue.full() or input_bytes + len(data) > 1024 * 1024:
+                        await ws.close(code=4000, reason="Terminal input backlog exceeded")
+                        return
+                    input_bytes += len(data)
+                    # A blocked paste must not prevent reading output acknowledgements.
+                    input_queue.put_nowait(data)
                 elif "text" in msg and msg["text"]:
                     try:
                         payload = json.loads(msg["text"])
-                        if payload.get("type") == "resize":
+                        if payload.get("type") == "ack" and flow_control:
+                            consumed = payload.get("cursor")
+                            if type(consumed) is not int or not acknowledged <= consumed <= cursor:
+                                await ws.close(code=4000, reason="Invalid output acknowledgement")
+                                return
+                            acknowledged = consumed
+                            session["viewer_ack"] = consumed
+                            session["output_consumed"].set()
+                        elif payload.get("type") == "resize":
                             cols = payload.get("cols", 80)
                             rows = payload.get("rows", 24)
                             _do_resize(rows, cols)
@@ -2478,19 +2649,26 @@ if ENABLE_TERMINAL:
                                 await ws.send_json({"type": "chat", "chat_id": chat_id})
                     except (json.JSONDecodeError, KeyError):
                         pass
-        tasks = (asyncio.create_task(_pty_reader()), asyncio.create_task(_ws_reader()))
-        session["io_tasks"] = tasks
+        tasks = (asyncio.create_task(_pty_reader()), asyncio.create_task(_ws_reader()),
+                 asyncio.create_task(_input_writer()))
+        session["viewer_tasks"] = tasks
         try:
             await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            pass
         finally:
             stop_event.set()
             for task in tasks:
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            await _cleanup_session(session_id)
+            session["connected"] = False
+            session.pop("viewer_ack", None)
+            session["output_consumed"].set()
+            session["detached_at"] = time.monotonic()
+            session["viewer_tasks"] = ()
             try:
+                await asyncio.gather(*tasks, return_exceptions=True)
                 await ws.close()
-            except (WebSocketDisconnect, RuntimeError):
+            except (asyncio.CancelledError, WebSocketDisconnect, RuntimeError):
                 pass
 
 

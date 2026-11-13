@@ -351,6 +351,10 @@ class Desktop:
             shutil.rmtree(self.runtime, ignore_errors=True)
 
 
+def desktop_key(request, fs):
+    return (fs.workspace_root or request.headers.get("x-user-id", ""), fs.home)
+
+
 async def get_desktop(request, fs):
     if not available():
         raise HTTPException(503, "Desktop is not installed on this terminal")
@@ -358,7 +362,7 @@ async def get_desktop(request, fs):
         from open_terminal.desktop_native import check_permissions
 
         check_permissions()
-    key = (request.headers.get("x-user-id", ""), fs.home)
+    key = desktop_key(request, fs)
     async with startup_lock:
         desktop = desktops.get(key)
         if desktop and all(p.returncode is None for p in desktop.processes):

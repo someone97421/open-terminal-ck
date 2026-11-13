@@ -1,6 +1,6 @@
 # Pin to a specific patch version for reproducible builds.
 # To pick up security patches, bump this version and rebuild.
-FROM python:3.12.13
+FROM python:3.12.16
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     # Core utilities
@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Editors
     vim nano \
     # Version control
-    git \
+    git gh \
     # Build tools
     build-essential cmake make \
     # Scripting & languages
@@ -50,6 +50,7 @@ RUN curl -fsSL https://get.docker.com | sh
 WORKDIR /app
 
 RUN pip install --no-cache-dir \
+    uv \
     numpy pandas scipy scikit-learn \
     matplotlib seaborn plotly \
     jupyter ipython \
@@ -66,6 +67,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xauth xdotool xclip scrot libreoffice libreoffice-gtk3 pulseaudio pulseaudio-utils \
     && rm -rf /var/lib/apt/lists/*
 
+# Xfce's default backdrop, converted to PNG for its image loader.
+COPY assets/home.webp /tmp/wallpaper.webp
+RUN mkdir -p /usr/share/backgrounds/xfce \
+    && convert /tmp/wallpaper.webp /usr/share/backgrounds/xfce/open-webui.png \
+    && ln -sf open-webui.png /usr/share/backgrounds/xfce/xfce-x.svg \
+    && rm /tmp/wallpaper.webp
+
 # Debian's launcher resets CHROMIUM_FLAGS before reading this directory.
 RUN printf '%s\n' \
     'case "${OPEN_TERMINAL_BROWSER_NO_SANDBOX:-false}" in' \
@@ -76,7 +84,7 @@ COPY . .
 # Create a capability-bearing Python copy for the server process only.
 # The system python3 stays clean so user-spawned Python processes remain
 # dumpable (readable via /proc/[pid]/fd/ for port detection).
-RUN pip install --no-cache-dir . \
+RUN pip install --no-cache-dir '.[notebooks]' \
     && cp "$(readlink -f "$(which python3)")" /usr/local/bin/python3-ot \
     && setcap cap_setgid+ep /usr/local/bin/python3-ot \
     && sed -i "1s|.*|#!/usr/local/bin/python3-ot|" "$(which open-terminal)"

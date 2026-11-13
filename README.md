@@ -1,6 +1,6 @@
 # ⚡ Open Terminal
 
-> Personal self-hosted fork of `open-webui/open-terminal`, maintained for private use. No images or packages are published from here, nothing is contributed upstream, and community process documents are archived in [docs/archive](docs/archive) for reference only.
+> `open-webui/open-terminal` 的个人自托管定制版，保留个人 fork 现有的手动 CI 与 DockerHub 发布配置，仅向个人 origin 推送，不向上游贡献；社区流程文档归档于 [docs/archive](docs/archive)。
 
 A lightweight, self-hosted terminal that gives AI agents and automation tools a dedicated environment to run commands, manage files, and execute code — all through a simple API.
 
@@ -21,7 +21,7 @@ You can run it two ways:
 
 ### Docker (recommended)
 
-This repository publishes no images, so build locally first:
+可在本地构建并运行当前定制代码；个人 DockerHub 发布沿用现有手动工作流：
 
 ```bash
 docker build -t open-terminal-ck .
@@ -62,9 +62,11 @@ docker run -d -p 8000:8000 -e OPEN_TERMINAL_API_KEY=secret open-terminal-ck:slim
 > [!NOTE]
 > The OpenShift image is for restricted non-root pod policies. It does not support runtime package installs, Docker socket access, the iptables egress firewall, or `OPEN_TERMINAL_MULTI_USER=true`. Build a custom image ahead of time when OpenShift users need extra tools.
 
+Notebook 已拆为 `notebooks` 可选依赖。完整 `Dockerfile` 保留 Jupyter，并显式安装 `.[notebooks]`；`slim`、`alpine` 和 `openshift` 也显式安装该 extra，保留已有 Notebook API。普通 `pip install .` 默认不含 Notebook；未安装依赖时服务可启动，但不提供 Notebook 功能。
+
 #### Updating
 
-No image is pulled from a registry. Rebuild the local image, then recreate the container:
+本地构建部署可重新构建镜像并重建容器：
 
 ```bash
 docker build -t open-terminal-ck .
@@ -85,6 +87,10 @@ uv run open-terminal run --host 0.0.0.0 --port 8000 --api-key your-secret-key
 pip install .
 open-terminal run --host 0.0.0.0 --port 8000 --api-key your-secret-key
 ```
+
+需要保留 Notebook 时，使用 `pip install '.[notebooks]'`，或在源码目录先执行 `uv sync --extra notebooks`，再使用 `uv run --extra notebooks open-terminal run ...`。可与 `mcp` extra 同时安装。
+
+`OPEN_TERMINAL_START_DIR`（TOML `start_dir`）仅作为非隔离模式新会话的默认目录：路径须已存在且位于 home 内；显式 cwd 和已有会话 cwd 优先。隔离工作区继续读取持久化 cwd，不由此选项覆盖，也不在启动时自动执行 setup script。
 
 > [!CAUTION]
 > On bare metal, commands run directly on your machine with your user's permissions. Use Docker if you want sandboxed execution.

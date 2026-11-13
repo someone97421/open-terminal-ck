@@ -6,6 +6,9 @@ from open_terminal import config
 def sanitized_environ(extra: dict[str, str] | None = None) -> dict[str, str]:
     """Exclude inherited server settings; explicit command overrides still win."""
     env = {key: value for key, value in os.environ.items() if not key.startswith("OPEN_TERMINAL_")}
+    if BROWSER_NO_SANDBOX:
+        # The Docker image's Chromium launcher reads this to add --no-sandbox.
+        env["OPEN_TERMINAL_BROWSER_NO_SANDBOX"] = "true"
     if extra:
         env.update(extra)
     return env
@@ -139,6 +142,11 @@ ENABLE_NOTEBOOKS = os.environ.get(
     str(config.get("enable_notebooks", True)),
 ).lower() not in ("false", "0", "no")
 
+# Notebook support is optional; the base package must start without Jupyter.
+if ENABLE_NOTEBOOKS:
+    from importlib.util import find_spec
+    ENABLE_NOTEBOOKS = all(find_spec(module) is not None for module in ("nbclient", "ipykernel"))
+
 ENABLE_BROWSER = os.environ.get(
     "OPEN_TERMINAL_ENABLE_BROWSER",
     str(config.get("enable_browser", True)),
@@ -194,6 +202,13 @@ OPEN_TERMINAL_INFO = os.environ.get(
 FILE_BROWSER_ROOT = os.environ.get(
     "OPEN_TERMINAL_FILE_BROWSER_ROOT",
     config.get("file_browser_root", "home"),
+).strip()
+
+# Where every session, shell, and command starts unless a request names a directory.
+# "~", "~/path", or a path relative to home; folders outside home are ignored.
+START_DIR = os.environ.get(
+    "OPEN_TERMINAL_START_DIR",
+    config.get("start_dir", ""),
 ).strip()
 
 # How long (in seconds) to keep per-session cwd entries in memory.

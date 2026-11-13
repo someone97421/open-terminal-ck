@@ -1,14 +1,14 @@
-FROM python:3.12.13-slim AS builder
+FROM python:3.12.16-slim AS builder
 
 WORKDIR /src
 
 COPY pyproject.toml README.md uv.lock* ./
 COPY open_terminal/ open_terminal/
 
-RUN pip install --no-cache-dir --prefix=/install .
+RUN pip install --no-cache-dir --prefix=/install '.[notebooks]'
 
 
-FROM python:3.12.13-slim
+FROM python:3.12.16-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
