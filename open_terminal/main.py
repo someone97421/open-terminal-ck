@@ -179,6 +179,8 @@ def get_file_browser_root(fs: UserFS) -> dict[str, str] | None:
     if mode in ("", "home"):
         return {"path": fs.home, "label": "Home"}
     if mode == "filesystem":
+        if fs.workspace_root:
+            return {"path": fs.workspace_root, "label": "Home"}
         return None
 
     path = configured.replace("{{home}}", fs.home)
@@ -187,7 +189,10 @@ def get_file_browser_root(fs: UserFS) -> dict[str, str] | None:
     elif path.startswith("~/"):
         path = os.path.join(fs.home, path[2:])
 
-    root_path = fs.resolve_path(path)
+    try:
+        root_path = fs.resolve_path(path)
+    except PermissionError:
+        root_path = fs.workspace_root or fs.home
     label = "Home" if root_path == fs.home else os.path.basename(root_path) or root_path
     return {"path": root_path, "label": label}
 
