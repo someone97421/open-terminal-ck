@@ -1,12 +1,13 @@
 import os
+from importlib.metadata import version
 
 import click
-import uvicorn
 
 
 @click.group()
+@click.version_option(package_name="open-terminal")
 def main():
-    """open-terminal — terminal interaction API"""
+    """Open Terminal provides a remote computer API."""
     pass
 
 
@@ -55,6 +56,14 @@ BANNER = r"""
     help="Publish a temporary public HTTPS URL using Cloudflare. Requires a configured API key; offers to download cloudflared if needed.",
 )
 @click.option("--yes", is_flag=True, help="Approve the pinned cloudflared download (requires --cftunnel).")
+@click.option(
+    "--desktop-mode", type=click.Choice(["virtual", "host"]), default=None,
+    help="Linux desktop: separate session (default) or share the logged-in desktop.",
+)
+@click.option(
+    "--desktop-environment", type=click.Choice(["auto", "gnome", "xfce"]), default=None,
+    help="Virtual desktop environment (default: XFCE; auto also selects XFCE). Choose gnome explicitly to use GNOME.",
+)
 def run(
     host: str | None,
     port: int | None,
@@ -64,6 +73,8 @@ def run(
     cors_allowed_origins: str,
     cftunnel: bool,
     yes: bool,
+    desktop_mode: str | None,
+    desktop_environment: str | None,
 ):
     """Start the sandbox API server."""
     import secrets
@@ -76,6 +87,10 @@ def run(
 
     # Load config files before resolving other settings.
     cfg = config.init(config_path)
+    if desktop_mode is not None:
+        os.environ["OPEN_TERMINAL_DESKTOP_MODE"] = desktop_mode
+    if desktop_environment is not None:
+        os.environ["OPEN_TERMINAL_DESKTOP_ENVIRONMENT"] = desktop_environment
 
     # Resolve host/port: CLI flag > config file > built-in default
     host = host or cfg.get("host", "127.0.0.1" if cftunnel else "0.0.0.0")
@@ -121,6 +136,8 @@ def run(
         binary = resolve_binary(yes=yes)
 
     click.echo(BANNER)
+    click.echo(f"  Open Terminal v{version('open-terminal')}")
+    click.echo()
 
     # -- Startup info block --
     local_url = f"http://{'localhost' if host in ('0.0.0.0', '127.0.0.1') else host}:{port}"
@@ -167,10 +184,34 @@ def run(
     if cftunnel:
         run_server(binary, host, port, loop=UVICORN_LOOP, **uvicorn_options)
         return
+    import uvicorn
+
     uvicorn.run(
         "open_terminal.main:app", host=host, port=port, loop=UVICORN_LOOP,
         **uvicorn_options,
     )
+
+
+@main.command("install-deps")
+@click.argument("features", nargs=-1, type=click.Choice(["desktop", "browser"]))
+@click.option("--package", "extra", multiple=True, help="Also install this apt package. Repeat for more.")
+@click.option("--dry-run", is_flag=True, help="Print what would be installed without installing it.")
+@click.option("--yes", is_flag=True, help="Install without asking.")
+def install_deps(features: tuple[str, ...], extra: tuple[str, ...], dry_run: bool, yes: bool):
+    """Install the system packages for Desktop and Chrome tabs.
+
+    Installs both unless FEATURES names one, or only --package is given.
+    Supports Debian and Ubuntu and needs root or sudo. Restart Open Terminal
+    afterwards.
+    """
+    from open_terminal import config
+
+    config.init()
+
+    from open_terminal.utils import packages
+
+    features = features or (() if extra else packages.FEATURES)
+    raise SystemExit(packages.install(features, extra, dry_run=dry_run, yes=yes))
 
 
 @main.command()

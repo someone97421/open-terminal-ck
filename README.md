@@ -56,6 +56,8 @@ docker run -d -p 8000:8000 -e OPEN_TERMINAL_API_KEY=secret open-terminal-ck:slim
 > [!NOTE]
 > Slim and Alpine don't support `OPEN_TERMINAL_PACKAGES` / `OPEN_TERMINAL_PIP_PACKAGES` / `OPEN_TERMINAL_NPM_PACKAGES`. To add packages, extend [Dockerfile.slim](Dockerfile.slim) or [Dockerfile.alpine](Dockerfile.alpine).
 
+Linux 桌面默认使用独立 XFCE 会话，可用 `--desktop-environment gnome` 或 `--desktop-mode host` 切换；Debian/Ubuntu 可用 `open-terminal install-deps` 安装桌面与浏览器依赖，详见[桌面配置](docs/configuration.md#desktop)。隔离工作区仍禁用桌面和浏览器。
+
 > [!NOTE]
 > The default `latest` image includes LibreOffice for Word, Excel, and PowerPoint to PDF conversions. The `slim`, `alpine`, and `openshift` images stay minimal; build a custom image if those variants need Office conversion tools.
 

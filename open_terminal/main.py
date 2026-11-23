@@ -37,7 +37,7 @@ from open_terminal.env import sanitized_environ
 from open_terminal.env import WORKSPACE_ISOLATION, WORKSPACE_DIR, IMAGE_MAX_EDGE, IMAGE_MAX_BYTES, IMAGE_MAX_PIXELS
 from open_terminal.workspace_context import PROTOCOL as WORKSPACE_CONTEXT_PROTOCOL, PROJECT_PROTOCOL
 from open_terminal.utils.runner import PipeRunner, ProcessRunner, create_runner, read_pty, write_pty, PtyRunner
-from open_terminal.utils.fs import UserFS, FullFileResponse as FileResponse, TemporaryFileResponse, text_file_response, line_range_offsets
+from open_terminal.utils.fs import UserFS, FullFileResponse as FileResponse, TemporaryFileResponse, edit_patch, text_file_response, line_range_offsets
 from open_terminal.utils.limits import (CHUNK_SIZE, NormalizeNullQueryMiddleware, run_io, run_worker)
 from open_terminal.utils.file_compare import CompareRequest, run_comparison
 from open_terminal.utils.git import GitRepository
@@ -244,7 +244,7 @@ async def lifespan(app):
             from open_terminal.browser.router import shutdown as shutdown_browsers
             await shutdown_browsers()
         if ENABLE_DESKTOP:
-            from open_terminal.desktop import shutdown as shutdown_desktops
+            from open_terminal.desktop.router import shutdown as shutdown_desktops
             await shutdown_desktops()
         global _port_proxy_client
         if _port_proxy_client is not None:
@@ -1045,11 +1045,24 @@ async def write_file(http_request: Request, request: WriteRequest, fs: UserFS = 
     session_id = http_request.headers.get("x-session-id")
     session_cwd = _get_session_cwd(session_id, fs)
     target = fs.resolve_path(request.path, cwd=session_cwd)
+    created = not await fs.exists(target)
+    previous = None
+    if not created:
+        try:
+            previous = await fs.read_text(target)
+        except (OSError, UnicodeDecodeError):
+            pass
     try:
         await fs.write(target, request.content)
     except (OSError, subprocess.CalledProcessError) as e:
         raise HTTPException(status_code=400, detail=str(e))
-    return {"path": target, "size": len(request.content.encode())}
+    result = {"path": target, "size": len(request.content.encode()), "created": created}
+    # A new file's diff is the content itself, which the caller already has.
+    if previous is not None:
+        patch = await run_io(edit_patch, target, previous, request.content)
+        if patch is not None:
+            result["patch"] = patch
+    return result
 
 
 @app.post(
@@ -1137,6 +1150,7 @@ async def replace_file_content(http_request: Request, request: ReplaceRequest, f
         content = await fs.read_text(target)
     except OSError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    original = content
 
     for chunk in request.replacements:
         if chunk.start_line or chunk.end_line:
@@ -1168,7 +1182,11 @@ async def replace_file_content(http_request: Request, request: ReplaceRequest, f
     except OSError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    return {"path": target, "size": len(content.encode())}
+    result = {"path": target, "size": len(content.encode())}
+    patch = await run_io(edit_patch, target, original, content)
+    if patch is not None:
+        result["patch"] = patch
+    return result
 
 
 @app.get(
@@ -1843,12 +1861,12 @@ async def execute(
 
     env = request.env
     if ENABLE_DESKTOP:
-        from open_terminal.desktop import Desktop, desktops, desktop_key
+        from open_terminal.desktop.router import desktops, desktop_key
 
         desktop = desktops.get(desktop_key(http_request, fs))
-        if isinstance(desktop, Desktop):
+        if desktop is not None and hasattr(desktop, "command_env"):
             # Lets windows opened by commands appear on the user's running desktop.
-            env = {"DISPLAY": desktop.env["DISPLAY"], "XAUTHORITY": desktop.env["XAUTHORITY"], **(request.env or {})}
+            env = {**desktop.command_env, **(request.env or {})}
 
     runner = await create_runner(request.command, cwd, env, run_as_user=fs.username)
 
@@ -2692,7 +2710,7 @@ if ENABLE_BROWSER:
     app.include_router(browser_router)
 
 if ENABLE_DESKTOP:
-    from open_terminal.desktop import router as desktop_router, available as desktop_available
+    from open_terminal.desktop.router import router as desktop_router, available as desktop_available
     app.include_router(desktop_router, include_in_schema=desktop_available())
 
 
